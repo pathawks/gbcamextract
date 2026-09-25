@@ -99,50 +99,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
-name = "gamut-av1"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7281f68cb437b34726d4eb788c7a9fab10724c166c4ae5cfda6ff65f7155ae94"
-dependencies = [
- "gamut-bitstream",
- "gamut-color",
- "gamut-core",
- "gamut-dsp",
-]
-
-[[package]]
-name = "gamut-avif"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a6df2615bd17e126f3a0b6716430206b97fcf2f9fa0acc2725a5052e9e06b09"
-dependencies = [
- "gamut-av1",
- "gamut-codec-abi",
- "gamut-color",
- "gamut-core",
- "gamut-isobmff",
-]
-
-[[package]]
 name = "gamut-bitstream"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "706ef7c7342d2cf3d2737690a6127b1c91f908add9d18c72e5d17c3931f2fe6a"
-dependencies = [
- "gamut-core",
-]
-
-[[package]]
-name = "gamut-codec-abi"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38704051ac2980276478f6eb9c55a26fb608151f8e42c355f5a699a2f3afde03"
-
-[[package]]
-name = "gamut-color"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fde55ae76aee646990fd4f353574fbcfaf9f37a5f3e54ba0907c7d384936e56a"
 dependencies = [
  "gamut-core",
 ]
@@ -155,12 +115,6 @@ checksum = "b17c79c8672b675d538dceffda1dd5d00ba279cbcca4f75c7b4fa847741d5d31"
 dependencies = [
  "thiserror",
 ]
-
-[[package]]
-name = "gamut-dsp"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed494150ad7376cd7e5f8775d175c5a22e497604f31ebc0ce47d94554d7861fb"
 
 [[package]]
 name = "gamut-isobmff"
@@ -176,8 +130,8 @@ name = "gbcamextract"
 version = "1.1.0"
 dependencies = [
  "clap",
- "gamut-avif",
- "gamut-core",
+ "gamut-bitstream",
+ "gamut-isobmff",
 ]
 
 [[package]]

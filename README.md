@@ -11,11 +11,15 @@ gbcamextract [-r rom.gb] -s save.sav
 
 This will produce 30 AVIF files containing your photos. It is optional to specify the rom; this will allow the picture frames to be extracted too.
 
-Each file is a single lossless 160x144 8-bit AVIF still using the four
-Game Boy grey levels (0, 85, 170, 255). Layered output (border as
-background, photo as overlay) is not used: an `iovl` overlay is not valid
-AVIF, and AVIF grids require tiles of at least 64x64px, so neither renders
-in standard viewers.
+Each file is a single lossless 160x144 8-bit monochrome AVIF still using
+the four Game Boy grey levels (0, 85, 170, 255). The files are written by
+a purpose-built lossless AV1 encoder (`src/mono.rs`): every 16x16 block is
+coded `skip` with DC prediction plus a small luma palette holding the
+block's exact colors, with adapting CDFs. On typical photos this lands
+within a few percent of the old 2-bit PNG sizes. Layered output (border
+as background, photo as overlay) is not used: an `iovl` overlay is not
+valid AVIF, and AVIF grids require tiles of at least 64x64px, so neither
+renders in standard viewers.
 
 ## Building
 
@@ -24,9 +28,9 @@ cargo build --release
 ```
 
 The binary is at `target/release/gbcamextract`. No system libraries are
-needed: AVIF encoding is done with the pure-Rust `gamut-avif` crate
-(`gamut-av1` encoder, `gamut-isobmff` container), and argument parsing with
-`clap`.
+needed: the container is written with the pure-Rust `gamut-isobmff`
+crate, the arithmetic coder comes from pure-Rust `gamut-bitstream`, and
+argument parsing uses `clap`.
 
 
 ## License

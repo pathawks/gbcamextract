@@ -1,9 +1,8 @@
 use clap::Parser;
-use gamut_avif::AvifEncoder;
-use gamut_core::{Dimensions, EncodeImage, ImageRef, Rgb8};
-use std::io;
 use std::path::PathBuf;
 use std::process;
+
+mod mono;
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 144;
@@ -209,41 +208,25 @@ fn canvas_block(
     }
 }
 
-/// Full-canvas RGB pixels (gray, R=G=B), row-major.
+/// Full-canvas 8-bit gray pixels, row-major.
 fn render_photo(
     rom: Option<(&[u8], &FrameInfo)>,
     save: &[u8],
     base_address: usize,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; CANVAS_PIXELS * 3];
+    let mut out = vec![0u8; CANVAS_PIXELS];
     for by in 0..18 {
         for bx in 0..20 {
             let block = canvas_block(rom, save, base_address, bx, by);
             for r in 0..8 {
                 for c in 0..8 {
-                    let v = GRAY_8BIT[block[r * 8 + c] as usize];
-                    let o = ((by * 8 + r) * WIDTH as usize + bx * 8 + c) * 3;
-                    out[o] = v;
-                    out[o + 1] = v;
-                    out[o + 2] = v;
+                    out[(by * 8 + r) * WIDTH as usize + bx * 8 + c] =
+                        GRAY_8BIT[block[r * 8 + c] as usize];
                 }
             }
         }
     }
     out
-}
-
-/// Lossless AVIF still. The encoder is bit-exact: decoding yields the
-/// input pixels unchanged.
-fn encode_avif(encoder: &AvifEncoder, rgb: &[u8]) -> io::Result<Vec<u8>> {
-    let image = ImageRef::<Rgb8>::new(rgb, Dimensions {
-        width: WIDTH,
-        height: HEIGHT,
-    })
-    .map_err(|e| io::Error::other(format!("image wrap: {e:?}")))?;
-    encoder
-        .encode_to_vec(image)
-        .map_err(|e| io::Error::other(format!("avif encode: {e:?}")))
 }
 
 fn main() {
@@ -287,7 +270,6 @@ fn main() {
         None => None,
     };
     let rom_ref: Option<&[u8]> = rom.as_deref();
-    let encoder = AvifEncoder::new();
 
     for slot_num in 1..=30usize {
         let pic_num = get_pic_num_for_slot_num(&save, slot_num);
@@ -306,8 +288,8 @@ fn main() {
             _ => None,
         };
 
-        let rgb = render_photo(rom_tuple, &save, base_address);
-        let avif = match encode_avif(&encoder, &rgb) {
+        let gray = render_photo(rom_tuple, &save, base_address);
+        let avif = match mono::encode_gray(&gray, WIDTH, HEIGHT) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("gbcamextract: couldn't encode {}: {}", slot_num, e);

@@ -11,5 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-gamut-avif = "1"
-gamut-core = "2"
+gamut-bitstream = "0.2"
+gamut-isobmff = "2"
