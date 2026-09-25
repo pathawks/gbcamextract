@@ -1,16 +1,31 @@
 use clap::Parser;
-use std::fs::File;
+use gamut_avif::AvifEncoder;
+use gamut_core::{Dimensions, EncodeImage, ImageRef, Rgb8};
 use std::io;
 use std::path::PathBuf;
 use std::process;
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 144;
-const ROW_SIZE: usize = 40;
-const PIXEL_BUFFER_SIZE: usize = ROW_SIZE * HEIGHT as usize;
 const SAVE_SIZE: usize = 128 * 1024;
 const ROM_SIZE: usize = 1024 * 1024;
 const BANK_SIZE: usize = 0x4000;
+
+// Output is a single flat 160x144 lossless AVIF still per photo.
+// (A 'grid' of small tiles would isolate border from photo, but MIAF
+// requires grid tiles to be at least 64x64px, and an 'iovl' overlay is
+// not valid AVIF at all, so neither renders in standard viewers.)
+const CANVAS_PIXELS: usize = WIDTH as usize * HEIGHT as usize;
+
+const PHOTO_X: u32 = 16;
+const PHOTO_Y: u32 = 16;
+const PHOTO_W: u32 = 128;
+const PHOTO_H: u32 = 112;
+
+// AV1 has no 2-bit depth (8-bit minimum), so the four Game Boy shades are
+// stored as evenly spaced 8-bit gray levels (R=G=B). Encoding is lossless,
+// so these exact values survive the round trip.
+const GRAY_8BIT: [u8; 4] = [0, 85, 170, 255];
 
 const HELLO_KITTY_FRAME_OFFSETS: [[usize; 2]; 25] = [
     [0xC6C70, 0xCF5D0],
@@ -77,37 +92,10 @@ fn slot_num_to_base_address(slot_num: usize) -> usize {
     (slot_num + 1) * 0x1000
 }
 
-fn interleave_bytes(low: u8, high: u8) -> u16 {
-    let mut result: u16 = 0;
-    result |= low as u16 & 1;
-    result |= (high as u16 & 1) << 1;
-    result |= (low as u16 & 2) << 1;
-    result |= (high as u16 & 2) << 2;
-    result |= (low as u16 & 4) << 2;
-    result |= (high as u16 & 4) << 3;
-    result |= (low as u16 & 8) << 3;
-    result |= (high as u16 & 8) << 4;
-    result |= (low as u16 & 16) << 4;
-    result |= (high as u16 & 16) << 5;
-    result |= (low as u16 & 32) << 5;
-    result |= (high as u16 & 32) << 6;
-    result |= (low as u16 & 64) << 6;
-    result |= (high as u16 & 64) << 7;
-    result |= (low as u16 & 128) << 7;
-    result |= (high as u16 & 128) << 8;
-    result
-}
-
-fn draw_span(pixel_buffer: &mut [u8; PIXEL_BUFFER_SIZE], tile: &[u8], x: usize, y: usize) {
-    let col = x / 4;
-    for row in 0..8 {
-        let p = col + (y + row) * ROW_SIZE;
-        let low = !tile[row * 2];
-        let high = !tile[row * 2 + 1];
-        let interleaved = interleave_bytes(low, high);
-        pixel_buffer[p] = (interleaved >> 8) as u8;
-        pixel_buffer[p + 1] = (interleaved & 0xff) as u8;
-    }
+struct FrameInfo {
+    addr: usize,
+    idx: usize,
+    is_hk: bool,
 }
 
 fn frame_base_address(rom: &[u8], frame_number: i32) -> (usize, usize) {
@@ -133,100 +121,129 @@ fn frame_base_address(rom: &[u8], frame_number: i32) -> (usize, usize) {
     }
 }
 
-fn convert(
-    rom: Option<&[u8]>,
-    save: &[u8],
-    pixel_buffer: &mut [u8; PIXEL_BUFFER_SIZE],
-    slot_num: usize,
-) {
-    let base_address = slot_num_to_base_address(slot_num);
-    let frame_number = save[base_address + 0xfb0] as i32;
-
-    let (frame_addr, eff_frame) = match rom {
-        Some(r) => {
-            let (a, i) = frame_base_address(r, frame_number);
-            (Some(a), Some(i))
-        }
-        None => (None, None),
-    };
-    let is_hk = rom.map(is_hk_rom).unwrap_or(false);
-
-    for y_tile in 0..14usize {
-        let y = 16 + y_tile * 8;
-        for (i, x) in (16..=(8 * 17)).step_by(8).enumerate() {
-            let off = base_address + y_tile * 256 + i * 16;
-            let tile = &save[off..off + 16];
-            draw_span(pixel_buffer, tile, x, y);
-        }
-
-        if let (Some(r), Some(faddr), Some(eff)) = (rom, frame_addr, eff_frame) {
-            let y = 16 + y_tile * 8;
-            for z in 0..4usize {
-                let tile_num = if is_hk {
-                    match r.get(HELLO_KITTY_FRAME_OFFSETS[eff][1] + 0x50 + y_tile * 4 + z) {
-                        Some(&b) => b as usize,
-                        None => continue,
-                    }
-                } else {
-                    match r.get(faddr + 0x650 + y_tile * 4 + z) {
-                        Some(&b) => b as usize,
-                        None => continue,
-                    }
-                };
-                let tile_off = faddr + tile_num * 16;
-                let tile = match r.get(tile_off..tile_off + 16) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let x = ((z & 1 != 0) as usize) * 8 + ((z & 2 != 0) as usize) * HEIGHT as usize;
-                draw_span(pixel_buffer, tile, x, y);
-            }
+/// Decode one 8x8 Game Boy 2bpp tile into 64 shade values (0-3).
+/// The bytes are inverted on load: a raw value of 0 (lightest) becomes 3.
+fn decode_gb_tile(raw: &[u8; 16]) -> [u8; 64] {
+    let mut px = [0u8; 64];
+    for row in 0..8 {
+        let low = raw[row * 2];
+        let high = raw[row * 2 + 1];
+        for col in 0..8 {
+            let lb = (low >> (7 - col)) & 1;
+            let hb = (high >> (7 - col)) & 1;
+            px[row * 8 + col] = 3 - ((hb << 1) | lb);
         }
     }
+    px
+}
 
-    if let (Some(r), Some(faddr), Some(eff)) = (rom, frame_addr, eff_frame) {
-        for x_tile in 0..20usize {
-            for z in 0..4usize {
-                let tile_num = if is_hk {
-                    match r.get(HELLO_KITTY_FRAME_OFFSETS[eff][1] + x_tile + 0x14 * z) {
-                        Some(&b) => b as usize,
-                        None => continue,
-                    }
-                } else {
-                    match r.get(faddr + 0x600 + x_tile + 0x14 * z) {
-                        Some(&b) => b as usize,
-                        None => continue,
-                    }
-                };
-                let tile_off = faddr + tile_num * 16;
-                let tile = match r.get(tile_off..tile_off + 16) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let x = x_tile * 8;
-                let y = ((z & 1 != 0) as usize) * 8 + ((z & 2 != 0) as usize) * 128;
-                draw_span(pixel_buffer, tile, x, y);
-            }
+/// Raw 16 bytes for the border 8x8 block at canvas block coords
+/// (`bx` in 0..20, `by` in 0..18), or `None` for the photo area.
+/// Corners belong to the top/bottom strips, matching the historical draw
+/// order (sides first, top/bottom over them).
+fn border_raw_tile(
+    rom: &[u8],
+    frame: &FrameInfo,
+    bx: usize,
+    by: usize,
+) -> Option<[u8; 16]> {
+    let x = bx * 8;
+    let y = by * 8;
+    let map_off = if (16..128).contains(&y) && !(16..144).contains(&x) {
+        // Side strips.
+        let y_tile = (y - 16) / 8;
+        let z = (bx % 2) + if x >= 144 { 2 } else { 0 };
+        if frame.is_hk {
+            HELLO_KITTY_FRAME_OFFSETS[frame.idx][1] + 0x50 + y_tile * 4 + z
+        } else {
+            frame.addr + 0x650 + y_tile * 4 + z
         }
+    } else if !(16..128).contains(&y) {
+        // Top/bottom strips (corners included).
+        let x_tile = bx;
+        let z = if y < 16 { by } else { by - 14 };
+        if frame.is_hk {
+            HELLO_KITTY_FRAME_OFFSETS[frame.idx][1] + x_tile + 0x14 * z
+        } else {
+            frame.addr + 0x600 + x_tile + 0x14 * z
+        }
+    } else {
+        return None;
+    };
+    let tile_num = *rom.get(map_off)? as usize;
+    let tile_off = frame.addr + tile_num * 16;
+    let bytes = rom.get(tile_off..tile_off + 16)?;
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(bytes);
+    Some(raw)
+}
+
+/// 2-bit pixels of the 8x8 canvas block at (`bx`, `by`).
+/// Missing data (no ROM, or a ROM lookup outside the file) is black,
+/// matching the historical behaviour of leaving the zeroed buffer alone.
+fn canvas_block(
+    rom: Option<(&[u8], &FrameInfo)>,
+    save: &[u8],
+    base_address: usize,
+    bx: usize,
+    by: usize,
+) -> [u8; 64] {
+    let x = (bx * 8) as u32;
+    let y = (by * 8) as u32;
+    if (PHOTO_X..PHOTO_X + PHOTO_W).contains(&x) && (PHOTO_Y..PHOTO_Y + PHOTO_H).contains(&y)
+    {
+        let i = ((x - PHOTO_X) / 8) as usize;
+        let j = ((y - PHOTO_Y) / 8) as usize;
+        let off = base_address + j * 256 + i * 16;
+        match save.get(off..off + 16) {
+            Some(b) => decode_gb_tile(b.try_into().unwrap()),
+            None => [0u8; 64],
+        }
+    } else if let Some((rom_data, frame)) = rom {
+        match border_raw_tile(rom_data, frame, bx, by) {
+            Some(raw) => decode_gb_tile(&raw),
+            None => [0u8; 64],
+        }
+    } else {
+        [0u8; 64]
     }
 }
 
-fn write_image_file(pixel_buffer: &[u8; PIXEL_BUFFER_SIZE], filename: &str) -> io::Result<()> {
-    let file = File::create(filename)?;
-    let mut encoder = png::Encoder::new(file, WIDTH, HEIGHT);
-    encoder.set_color(png::ColorType::Grayscale);
-    encoder.set_depth(png::BitDepth::Two);
-    encoder.set_compression(png::Compression::High);
+/// Full-canvas RGB pixels (gray, R=G=B), row-major.
+fn render_photo(
+    rom: Option<(&[u8], &FrameInfo)>,
+    save: &[u8],
+    base_address: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; CANVAS_PIXELS * 3];
+    for by in 0..18 {
+        for bx in 0..20 {
+            let block = canvas_block(rom, save, base_address, bx, by);
+            for r in 0..8 {
+                for c in 0..8 {
+                    let v = GRAY_8BIT[block[r * 8 + c] as usize];
+                    let o = ((by * 8 + r) * WIDTH as usize + bx * 8 + c) * 3;
+                    out[o] = v;
+                    out[o + 1] = v;
+                    out[o + 2] = v;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Lossless AVIF still. The encoder is bit-exact: decoding yields the
+/// input pixels unchanged.
+fn encode_avif(encoder: &AvifEncoder, rgb: &[u8]) -> io::Result<Vec<u8>> {
+    let image = ImageRef::<Rgb8>::new(rgb, Dimensions {
+        width: WIDTH,
+        height: HEIGHT,
+    })
+    .map_err(|e| io::Error::other(format!("image wrap: {e:?}")))?;
     encoder
-        .add_text_chunk("Source".to_string(), "Nintendo Gameboy Camera".to_string())
-        .map_err(io::Error::other)?;
-    encoder
-        .add_text_chunk("Software".to_string(), "gbcamextract".to_string())
-        .map_err(io::Error::other)?;
-    let mut writer = encoder.write_header().map_err(io::Error::other)?;
-    writer
-        .write_image_data(&pixel_buffer[..])
-        .map_err(io::Error::other)
+        .encode_to_vec(image)
+        .map_err(|e| io::Error::other(format!("avif encode: {e:?}")))
 }
 
 fn main() {
@@ -270,17 +287,38 @@ fn main() {
         None => None,
     };
     let rom_ref: Option<&[u8]> = rom.as_deref();
-
-    let mut pixel_buffer = [0u8; PIXEL_BUFFER_SIZE];
+    let encoder = AvifEncoder::new();
 
     for slot_num in 1..=30usize {
         let pic_num = get_pic_num_for_slot_num(&save, slot_num);
-        convert(rom_ref, &save, &mut pixel_buffer, slot_num);
-        let filename = match pic_num {
-            Some(n) => format!("IMG_{:02}.png", n),
-            None => format!("DEL_{:02}.png", slot_num),
+        let base_address = slot_num_to_base_address(slot_num);
+        let frame_number = save[base_address + 0xfb0] as i32;
+        let frame = rom_ref.map(|r| {
+            let (addr, idx) = frame_base_address(r, frame_number);
+            FrameInfo {
+                addr,
+                idx,
+                is_hk: is_hk_rom(r),
+            }
+        });
+        let rom_tuple: Option<(&[u8], &FrameInfo)> = match (&rom_ref, &frame) {
+            (Some(r), Some(f)) => Some((r, f)),
+            _ => None,
         };
-        if let Err(e) = write_image_file(&pixel_buffer, &filename) {
+
+        let rgb = render_photo(rom_tuple, &save, base_address);
+        let avif = match encode_avif(&encoder, &rgb) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("gbcamextract: couldn't encode {}: {}", slot_num, e);
+                process::exit(1);
+            }
+        };
+        let filename = match pic_num {
+            Some(n) => format!("IMG_{:02}.avif", n),
+            None => format!("DEL_{:02}.avif", slot_num),
+        };
+        if let Err(e) = std::fs::write(&filename, &avif) {
             eprintln!("gbcamextract: couldn't write {}: {}", filename, e);
             process::exit(1);
         }

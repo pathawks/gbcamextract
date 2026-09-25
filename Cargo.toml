@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-png = "0.18"
+gamut-avif = "1"
+gamut-core = "2"
