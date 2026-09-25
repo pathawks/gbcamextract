@@ -3,11 +3,12 @@
 //!
 //! Design (all profile 0, 8-bit, monochrome, still picture, single tile):
 //!
-//! * Uniform 16x16 blocks (16 divides the 160x144 canvas, so there are no
-//!   partial edge blocks anywhere). Every block is coded `skip = 1` with
-//!   `DC_PRED` plus an `iovl`-free luma palette holding the block's exact
-//!   colors — no transform, quantization, or coefficient coding exists on
-//!   this path at all, which is what makes a from-scratch encoder feasible.
+//! * Greedy `NONE` partitions at 64x64/32x32/16x16 (a node whose
+//!   distinct levels fit the palette is never split). Every block is coded
+//!   `skip = 1` with `DC_PRED` plus an `iovl`-free luma palette holding the
+//!   block's exact colors — no transform, quantization, or coefficient
+//!   coding exists on this path at all, which is what makes a from-scratch
+//!   encoder feasible.
 //! * Static default CDFs are the starting point, but every `S()` symbol
 //!   adapts its row (`disable_cdf_update = 0`) except split_or outcomes,
 //!   which dav1d decodes with the non-updating bool reader; no
@@ -90,11 +91,22 @@ const INTRA_Y_DC_ROW: [u16; 13] = [
     32768,
 ];
 
-/// `Default_Palette_Y_Mode_Cdf[2]` — block-size context 2 is the 16x16 row.
-const PALETTE_Y_MODE_B2: [[u16; 2]; 3] = [[31823, 32768], [3400, 32768], [781, 32768]];
+/// `Default_Palette_Y_Mode_Cdf`, rows for the block sizes we emit,
+/// indexed `[bsl - 2]` (16x16 ⇒ sz_ctx 2, 32x32 ⇒ sz_ctx 4, 64x64 ⇒
+/// sz_ctx 6, since sz_ctx = b_dim[2] + b_dim[3] - 2). Verified against
+/// dav1d's `cdf.c` (row 2 matches the old single-size table).
+const PALETTE_Y_MODE: [[[u16; 2]; 3]; 3] = [
+    [[31823, 32768], [3400, 32768], [781, 32768]],
+    [[32309, 32768], [7337, 32768], [1462, 32768]],
+    [[32450, 32768], [7946, 32768], [129, 32768]],
+];
 
-/// `Default_Palette_Y_Size_Cdf[2]` — the 16x16 row (sizes 2..8).
-const PALETTE_Y_SIZE_B2: [u16; 7] = [7788, 12741, 17325, 20500, 24315, 28530, 32768];
+/// `Default_Palette_Y_Size_Cdf` (sizes 2..8), indexed `[bsl - 2]` like above.
+const PALETTE_Y_SIZE: [[u16; 7]; 3] = [
+    [7788, 12741, 17325, 20500, 24315, 28530, 32768],
+    [12725, 19180, 21863, 24839, 27535, 30120, 32768],
+    [14940, 20797, 21678, 24186, 27033, 28999, 32768],
+];
 
 /// `Default_Palette_Size_N_Y_Color_Cdf`, indexed [color ctx]. Only sizes
 /// 2..4 occur (2-bit source ⇒ at most 4 distinct levels per block).
@@ -146,15 +158,6 @@ fn av1c_mono8(level_idx: u8) -> [u8; 4] {
 /// Bits needed to hold `value - 1`, minimum 1.
 fn dimension_bits(value: u32) -> u32 {
     (32 - value.saturating_sub(1).leading_zeros()).max(1)
-}
-
-/// `CeilLog2(x)` (§4.7).
-fn ceil_log2(x: usize) -> u32 {
-    if x < 2 {
-        0
-    } else {
-        (x - 1).ilog2() + 1
-    }
 }
 
 /// Merged SPLIT-ish probability mass for `split_or_horz` (§9.5),
@@ -210,8 +213,8 @@ struct Cdfs {
     part_w16: [AdaptCdf; 4],
     skip: [AdaptCdf; 3],
     y_dc: AdaptCdf,
-    pal_mode: [AdaptCdf; 3],
-    pal_size: AdaptCdf,
+    pal_mode: [[AdaptCdf; 3]; 3],
+    pal_size: [AdaptCdf; 3],
     pal_idx2: [AdaptCdf; 5],
     pal_idx3: [AdaptCdf; 5],
     pal_idx4: [AdaptCdf; 5],
@@ -225,8 +228,9 @@ impl Cdfs {
             part_w16: PARTITION_W16.map(|row| AdaptCdf::new(&row)),
             skip: SKIP.map(|row| AdaptCdf::new(&row)),
             y_dc: AdaptCdf::new(&INTRA_Y_DC_ROW),
-            pal_mode: PALETTE_Y_MODE_B2.map(|row| AdaptCdf::new(&row)),
-            pal_size: AdaptCdf::new(&PALETTE_Y_SIZE_B2),
+            pal_mode: PALETTE_Y_MODE
+                .map(|rows| rows.map(|row| AdaptCdf::new(&row))),
+            pal_size: PALETTE_Y_SIZE.map(|row| AdaptCdf::new(&row)),
             pal_idx2: PALETTE_SIZE_2_Y_COLOR.map(|row| AdaptCdf::new(&row)),
             pal_idx3: PALETTE_SIZE_3_Y_COLOR.map(|row| AdaptCdf::new(&row)),
             pal_idx4: PALETTE_SIZE_4_Y_COLOR.map(|row| AdaptCdf::new(&row)),
@@ -356,6 +360,31 @@ impl<'a> TileEncoder<'a> {
         self.px[y * self.w + x]
     }
 
+    /// Count of distinct levels in the `bw4`-MI region at MI `(r, c)`,
+    /// saturating at 5 (only the ≤4 question matters: larger palettes
+    /// have no index tables in this encoder).
+    fn region_levels(&self, r: usize, c: usize, bw4: usize) -> usize {
+        let px = bw4 * 4;
+        let (sx, sy) = (c * 4, r * 4);
+        let xe = (sx + px).min(self.w);
+        let ye = (sy + px).min(self.mi_rows * 4);
+        let mut set = [false; 256];
+        let mut count = 0;
+        for y in sy..ye {
+            for x in sx..xe {
+                let v = self.sample(x, y) as usize;
+                if !set[v] {
+                    set[v] = true;
+                    count += 1;
+                    if count > 4 {
+                        return count;
+                    }
+                }
+            }
+        }
+        count
+    }
+
     /// Partition context bit (§8.3.2) from neighbour bytes.
     fn partition_ctx(&self, r: usize, c: usize, bsl: usize) -> usize {
         let bit = bsl - 1;
@@ -383,24 +412,35 @@ impl<'a> TileEncoder<'a> {
         }
     }
 
-    /// Emit the partition tree, splitting every node down to 16x16
-    /// (`bw4 == 4`) leaves. Offscreen subtrees emit nothing.
+    /// Emit the partition tree. A fully on-screen 32x32 or 64x64 node
+    /// whose distinct levels fit the palette (≤4 here — our index tables
+    /// only cover sizes 2..4) is coded `NONE` directly; anything else
+    /// splits down, with 16x16 (`bw4 == 4`) leaves as before. Offscreen
+    /// subtrees emit nothing, and partially on-screen nodes take the
+    /// existing edge (split_or / forced-split) path, never `NONE`.
     fn partition(&mut self, r: usize, c: usize, bw4: usize) {
         if r >= self.mi_rows || c >= self.mi_cols {
             return;
         }
+        let bsl = bw4.trailing_zeros() as usize;
         if bw4 == 4 {
-            let bsl = 2;
             let ctx = self.partition_ctx(r, c, bsl);
             self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
-            self.block(r, c);
+            self.block(r, c, bsl);
+            return;
+        }
+        if r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols && self.region_levels(r, c, bw4) <= 4
+        {
+            let ctx = self.partition_ctx(r, c, bsl);
+            self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
+            self.update_partition_ctx(r, c, bsl);
+            self.block(r, c, bsl);
             return;
         }
         let half = bw4 >> 1;
         let has_rows = r + half < self.mi_rows;
         let has_cols = c + half < self.mi_cols;
-        let bsl = bw4.trailing_zeros() as usize;
         if has_rows && has_cols {
             let ctx = self.partition_ctx(r, c, bsl);
             self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_SPLIT);
@@ -508,33 +548,46 @@ impl<'a> TileEncoder<'a> {
         }
     }
 
-    /// Code one 16x16 block at MI `(r, c)`: skip + DC + palette + indices.
-    fn block(&mut self, r: usize, c: usize) {
-        const BW: usize = 16;
+    /// Code one block at MI `(r, c)` with size `bsl` (2 ⇒ 16x16, 3 ⇒
+    /// 32x32, 4 ⇒ 64x64): skip + DC + palette + indices. Palette mode is
+    /// legal at all three sizes (dav1d gates it on `imax(bw4, bh4) <= 16`
+    /// MI); the index tables only cover sizes 2..4, so callers must keep
+    /// distinct levels ≤ 4.
+    fn block(&mut self, r: usize, c: usize, bsl: usize) {
+        let bw: usize = 4 << bsl;
         let (sx, sy) = (c * 4, r * 4);
 
         // Palette colors: sorted distinct levels (≤4 for 2-bit content).
-        // A flat block still needs a 2-entry table, so pair the value
-        // with a different level (never referenced by the index map).
         let mut set = [false; 256];
-        for i in 0..BW {
-            for j in 0..BW {
+        for i in 0..bw {
+            for j in 0..bw {
                 set[self.sample(sx + j, sy + i) as usize] = true;
             }
         }
         let mut colors: Vec<u8> = (0..256).filter(|&v| set[v]).map(|v| v as u8).collect();
         assert!(!colors.is_empty() && colors.len() <= 8);
+        // A flat block still needs a 2-entry table. Prefer padding with a
+        // cached level (nearly free via a reuse flag below) over an
+        // adjacent level (short delta chain); either way the pad value is
+        // never referenced by the index map.
+        let cache = self.palette_cache(r, c);
         if colors.len() == 1 {
-            colors.push(colors[0].wrapping_add(1));
+            let v = colors[0];
+            let pad = cache
+                .iter()
+                .find(|&&cc| cc != v)
+                .copied()
+                .unwrap_or(if v < 255 { v + 1 } else { v - 1 });
+            colors.push(pad);
             colors.sort_unstable();
         }
         let psize = colors.len();
 
-        let mut index_map = vec![0u8; BW * BW];
-        for i in 0..BW {
-            for j in 0..BW {
+        let mut index_map = vec![0u8; bw * bw];
+        for i in 0..bw {
+            for j in 0..bw {
                 let v = self.sample(sx + j, sy + i);
-                index_map[i * BW + j] = colors.binary_search(&v).unwrap_or(0) as u8;
+                index_map[i * bw + j] = colors.binary_search(&v).unwrap_or(0) as u8;
             }
         }
 
@@ -545,33 +598,78 @@ impl<'a> TileEncoder<'a> {
         // y_mode = DC_PRED (all neighbours are DC, so contexts are row 0).
         self.cdfs.y_dc.encode(&mut self.sym, DC_PRED);
 
-        // has_palette_y = 1 (16x16 ⇒ bctx 2; context = neighbours paletted).
+        // has_palette_y = 1 (context = neighbours paletted; CDF row
+        // selected by block size via `bsl`).
         let above_p = r > 0 && self.psize[(r - 1) * self.mi_cols + c] > 0;
         let left_p = c > 0 && self.psize[r * self.mi_cols + (c - 1)] > 0;
         let pctx = usize::from(above_p) + usize::from(left_p);
-        self.cdfs.pal_mode[pctx].encode(&mut self.sym, 1);
+        self.cdfs.pal_mode[bsl - 2][pctx].encode(&mut self.sym, 1);
 
-        // palette_size_y_minus_2, then the colors (no cache reuse: all
-        // use_palette_color_cache flags are 0; first color raw, rest deltas).
-        self.cdfs.pal_size.encode(&mut self.sym, psize - 2);
-        let cache = self.palette_cache(r, c);
-        for _ in 0..cache.len() {
-            self.sym.encode_literal(0, 1);
+        // palette_size_y_minus_2, then the colors: one L(1) reuse flag
+        // per palette-cache entry (equi-probable, non-adapting, stopping
+        // once pal_sz entries are collected — mirroring dav1d's
+        // read_pal_plane), then explicit coding for the rest (first color
+        // raw 8b, remaining deltas). Reusing every cached color we need is
+        // optimal: visited flag positions cost a bit either way, and every
+        // reuse shortens the delta chain and hastens the early stop. Only
+        // 4 gray levels exist globally, so the cache almost always covers
+        // the block — this is where the upscale's bits were going.
+        self.cdfs.pal_size[bsl - 2].encode(&mut self.sym, psize - 2);
+        let mut is_used = vec![false; psize];
+        let mut n_used = 0usize;
+        for &cc in &cache {
+            if n_used == psize {
+                break;
+            }
+            if let Ok(pos) = colors.binary_search(&cc) {
+                self.sym.encode_literal(1, 1);
+                is_used[pos] = true;
+                n_used += 1;
+            } else {
+                self.sym.encode_literal(0, 1);
+            }
         }
-        self.sym.encode_literal(u32::from(colors[0]), 8);
-        if psize > 1 {
-            self.sym.encode_literal(3, 2);
-            let mut palette_bits = 5 + 3u32;
-            for idx in 1..psize {
-                let delta = i32::from(colors[idx]) - i32::from(colors[idx - 1]);
-                self.sym.encode_literal((delta - 1) as u32, palette_bits);
-                let range = 256 - i32::from(colors[idx]) - 1;
-                palette_bits = palette_bits.min(ceil_log2(range.max(1) as usize));
+        let new_colors: Vec<u8> = colors
+            .iter()
+            .zip(is_used.iter())
+            .filter(|(_, &u)| !u)
+            .map(|(&c, _)| c)
+            .collect();
+        if n_used < psize {
+            self.sym.encode_literal(u32::from(new_colors[0]), 8);
+            if new_colors.len() > 1 {
+                // Minimal initial width covering the first delta
+                // (decoder computes bits = 5 + this field).
+                let first_delta = new_colors[1] as u32 - new_colors[0] as u32 - 1;
+                let need = if first_delta == 0 {
+                    1
+                } else {
+                    first_delta.ilog2() + 1
+                }
+                .max(5)
+                .min(8);
+                self.sym.encode_literal(need - 5, 2);
+                let mut palette_bits = need;
+                for k in 1..new_colors.len() {
+                    let delta = new_colors[k] as u32 - new_colors[k - 1] as u32 - 1;
+                    self.sym.encode_literal(delta, palette_bits);
+                    let prev = u32::from(new_colors[k]);
+                    if prev + 1 >= 255 {
+                        // Decoder fills any remaining slots with 255 and
+                        // stops; only reachable for a trailing 255.
+                        debug_assert!(k + 1 == new_colors.len());
+                        break;
+                    }
+                    // Matches dav1d's `1 + ulog2(max - prev - !pl)` with
+                    // ulog2(0) == 0 (note: plain CeilLog2 differs at
+                    // prev == 254, where the width stays 1, not 0).
+                    palette_bits = palette_bits.min(1 + (254 - prev).max(1).ilog2());
+                }
             }
         }
 
         // Bookkeeping for neighbour contexts of later blocks.
-        let n4 = 4;
+        let n4 = 1usize << bsl;
         for y in 0..n4 {
             for x in 0..n4 {
                 let (rr, cc) = (r + y, c + x);
@@ -585,13 +683,13 @@ impl<'a> TileEncoder<'a> {
         // color_index_map_y: first index via ns(), rest in wavefront order
         // as positions in the neighbour-derived ColorOrder.
         self.encode_ns(index_map[0] as usize, psize);
-        for i in 1..(2 * BW - 1) {
-            let mut j = i.min(BW - 1);
-            let j_end = i.saturating_sub(BW - 1);
+        for i in 1..(2 * bw - 1) {
+            let mut j = i.min(bw - 1);
+            let j_end = i.saturating_sub(bw - 1);
             loop {
                 let (rr, cc) = (i - j, j);
-                let (order, ctx) = palette_color_context(&index_map, BW, rr, cc, psize);
-                let actual = index_map[rr * BW + cc] as usize;
+                let (order, ctx) = palette_color_context(&index_map, bw, rr, cc, psize);
+                let actual = index_map[rr * bw + cc] as usize;
                 let sym = order.iter().position(|&x| x == actual).unwrap_or(0);
                 self.cdfs.pal_idx(psize, ctx).encode(&mut self.sym, sym);
                 if j == j_end {
