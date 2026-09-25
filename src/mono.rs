@@ -13,15 +13,20 @@
 //!   which dav1d decodes with the non-updating bool reader; no
 //!   segmentation, delta quantizers, loop filters, CDEF, restoration,
 //!   or film grain.
-//! * The container is a single `av01` primary item written with
-//!   `gamut-isobmff`; the arithmetic coder is `gamut-bitstream`'s.
+//! * The container holds two `av01` items per photo (see
+//!   `encode_gray_pair`): the 8x nearest-neighbor upscale as primary plus
+//!   the original-fidelity raster, grouped in an `altr` entity group. Each
+//!   item has its own `ispe`/`av1C` since levels differ (2.0 vs 4.0).
+//!   Written with `gamut-isobmff`; the arithmetic coder is `gamut-bitstream`'s.
 //!
 //! Box/syntax references are to the AV1 Bitstream & Decoding Process
 //! Specification: OBU framing §5.3, sequence header §5.5, frame header §5.9,
 //! partitions §5.11.3, palette §5.11.46/.49/.50, CDF tables §9.3/§9.4.
 
 use gamut_bitstream::{BitWriter, SymbolEncoder, write_leb128};
-use gamut_isobmff::{IsoBmffImage, Item, Property, PropertyKind, write as write_isobmff};
+use gamut_isobmff::{
+    EntityGroup, IsoBmffImage, Item, Property, PropertyKind, write as write_isobmff,
+};
 use std::io;
 
 // ---------------------------------------------------------------------------
@@ -125,9 +130,14 @@ const PARTITION_SPLIT: usize = 3;
 /// Intra mode value for DC prediction.
 const DC_PRED: usize = 0;
 
-/// `av1C` body for our stream: marker/version, profile 0 / level 2.0,
-/// monochrome with (1, 1) subsampling bytes, matching the sequence header.
-const AV1C_MONO8: [u8; 4] = [0x81, 0x00, 0x1c, 0x00];
+/// `av1C` body builder for our stream: marker/version, profile 0 / given
+/// level, monochrome with (1, 1) subsampling bytes, matching the sequence
+/// header. `level_idx` must equal the `seq_level_idx` in the item's
+/// Sequence Header OBU (AVIF §2.2.1: av1C fields shall match the sequence
+/// header).
+fn av1c_mono8(level_idx: u8) -> [u8; 4] {
+    [0x81, level_idx, 0x1c, 0x00]
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers (mirroring the spec / gamut-av1).
@@ -617,15 +627,44 @@ fn obu_wrap(obu_type: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Minimal defined `seq_level_idx` (AV1 Annex A) covering `w`x`h`.
+///
+/// Only defined levels are returned (2.0, 2.1, 3.0, 3.1, 4.0, 5.0, 6.0);
+/// still pictures only need the pic-size/dimension constraints, not the
+/// display/decode-rate ones. Falls back to 31 (maximum parameters) when
+/// nothing defined covers the size. AVIF Baseline (`MA1B`) caps at 5.1
+/// (8912896px, 8192x4352), so callers targeting Baseline should reject
+/// anything needing more than that.
+fn seq_level_idx_for(w: u32, h: u32) -> u8 {
+    // (idx, MaxPicSize, MaxHSize, MaxVSize) for defined still-relevant levels.
+    const LEVELS: [(u8, u32, u32, u32); 7] = [
+        (0, 147456, 2048, 1152),     // 2.0
+        (1, 278784, 2816, 1584),     // 2.1
+        (4, 665856, 4352, 2448),     // 3.0
+        (5, 1065024, 5504, 3096),    // 3.1
+        (8, 2359296, 6144, 3456),    // 4.0
+        (12, 8912896, 8192, 4352),   // 5.0
+        (16, 35651584, 16384, 8704), // 6.0
+    ];
+    let picsize = w.saturating_mul(h);
+    for (idx, max_pic, max_h, max_v) in LEVELS {
+        if picsize <= max_pic && w <= max_h && h <= max_v {
+            return idx;
+        }
+    }
+    31
+}
+
 /// Sequence header OBU payload: profile 0, still picture, reduced header,
-/// level 2.0 (covers 160x144), 64px superblocks, all loop tools off,
+/// minimal defined level covering `w`x`h` (2.0 for 160x144, 4.0 for
+/// 1280x1152), 64px superblocks, all loop tools off,
 /// monochrome full-range 8-bit, no film grain.
 fn sequence_header_obu(w: u32, h: u32) -> Vec<u8> {
     let mut bw = BitWriter::new();
     bw.put_bits(0, 3); // seq_profile = 0 (Main)
     bw.put_bit(1); // still_picture
     bw.put_bit(1); // reduced_still_picture_header
-    bw.put_bits(0, 5); // seq_level_idx = 0 (level 2.0)
+    bw.put_bits(u32::from(seq_level_idx_for(w, h)), 5); // seq_level_idx
     let wbits = dimension_bits(w);
     let hbits = dimension_bits(h);
     bw.put_bits(wbits - 1, 4); // frame_width_bits_minus_1
@@ -691,14 +730,13 @@ fn frame_header_bits() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point.
+// Public entry points.
 // ---------------------------------------------------------------------------
 
-/// Encode 8-bit single-plane gray pixels (`w`x`h`, 16-aligned) as a
-/// complete AVIF file: sequence header OBU + frame OBU (header + single
-/// tile group) wrapping the palette-coded tile data, in a single-`av01`
-/// monochrome primary item.
-pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
+/// Encode one raster to its AV1 item payload (sequence header OBU + frame
+/// OBU wrapping the palette-coded tile data). Returns the payload and the
+/// matching `av1C` body.
+fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> (Vec<u8>, [u8; 4]) {
     assert_eq!(gray.len(), w as usize * h as usize);
     assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
 
@@ -715,44 +753,96 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
     let mut payload = seq_obu;
     payload.extend_from_slice(&frame_obu);
 
+    let level_idx = seq_level_idx_for(w, h);
+    (payload, av1c_mono8(level_idx))
+}
+
+fn av01_item(id: u32, w: u32, h: u32, payload: Vec<u8>, av1c: [u8; 4]) -> Item {
+    Item {
+        id,
+        item_type: *b"av01",
+        name: String::new(),
+        content_type: None,
+        content_encoding: None,
+        hidden: false,
+        references: vec![],
+        properties: vec![
+            Property {
+                essential: false,
+                kind: PropertyKind::ImageSpatialExtents {
+                    width: w,
+                    height: h,
+                },
+            },
+            Property {
+                essential: true,
+                kind: PropertyKind::CodecConfiguration {
+                    kind: *b"av1C",
+                    data: av1c.to_vec(),
+                },
+            },
+            Property {
+                essential: false,
+                kind: PropertyKind::PixelInformation {
+                    bits_per_channel: vec![8],
+                },
+            },
+        ],
+        payload,
+    }
+}
+
+/// Encode 8-bit single-plane gray pixels (`w`x`h`, 16-aligned) as a
+/// complete AVIF file: sequence header OBU + frame OBU (header + single
+/// tile group) wrapping the palette-coded tile data, in a single-`av01`
+/// monochrome primary item.
+#[allow(dead_code)]
+pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
+    let (payload, av1c) = encode_obu_payload(gray, w, h);
+
     let image = IsoBmffImage {
         major_brand: *b"avif",
         minor_version: 0,
         compatible_brands: vec![*b"avif", *b"mif1", *b"miaf"],
         primary_item_id: 1,
-        items: vec![Item {
-            id: 1,
-            item_type: *b"av01",
-            name: String::new(),
-            content_type: None,
-            content_encoding: None,
-            hidden: false,
-            references: vec![],
-            properties: vec![
-                Property {
-                    essential: false,
-                    kind: PropertyKind::ImageSpatialExtents {
-                        width: w,
-                        height: h,
-                    },
-                },
-                Property {
-                    essential: true,
-                    kind: PropertyKind::CodecConfiguration {
-                        kind: *b"av1C",
-                        data: AV1C_MONO8.to_vec(),
-                    },
-                },
-                Property {
-                    essential: false,
-                    kind: PropertyKind::PixelInformation {
-                        bits_per_channel: vec![8],
-                    },
-                },
-            ],
-            payload,
-        }],
+        items: vec![av01_item(1, w, h, payload, av1c)],
         groups: vec![],
+    };
+    write_isobmff(&image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
+}
+
+/// Encode two rasters of the same picture (e.g. 160x144 original and its
+/// 8x nearest-neighbor upscale) into one AVIF file with two `av01` items.
+///
+/// Item 1 (primary) is the `large` raster, item 2 the `small` raster; both
+/// are non-hidden and grouped in an `altr` entity group so readers treat
+/// them as alternatives and display the primary by default (AVIF §5.1).
+/// Each item carries its own `ispe`/`av1C` (levels may differ: 2.0 vs 4.0).
+pub fn encode_gray_pair(
+    small: &[u8],
+    sw: u32,
+    sh: u32,
+    large: &[u8],
+    lw: u32,
+    lh: u32,
+) -> io::Result<Vec<u8>> {
+    let (small_payload, small_av1c) = encode_obu_payload(small, sw, sh);
+    let (large_payload, large_av1c) = encode_obu_payload(large, lw, lh);
+
+    let image = IsoBmffImage {
+        major_brand: *b"avif",
+        minor_version: 0,
+        compatible_brands: vec![*b"avif", *b"mif1", *b"miaf"],
+        primary_item_id: 1,
+        items: vec![
+            av01_item(1, lw, lh, large_payload, large_av1c),
+            av01_item(2, sw, sh, small_payload, small_av1c),
+        ],
+        groups: vec![EntityGroup {
+            group_type: *b"altr",
+            group_id: 10,
+            entity_ids: vec![1, 2],
+        }],
     };
     write_isobmff(&image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
 }

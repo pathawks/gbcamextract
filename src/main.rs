@@ -10,11 +10,19 @@ const SAVE_SIZE: usize = 128 * 1024;
 const ROM_SIZE: usize = 1024 * 1024;
 const BANK_SIZE: usize = 0x4000;
 
-// Output is a single flat 160x144 lossless AVIF still per photo.
+// Output is one AVIF still per photo with two `av01` items in an `altr`
+// group: the 8x nearest-neighbor upscale (1280x1152, primary, displayed by
+// default) plus the original-fidelity 160x144 raster.
 // (A 'grid' of small tiles would isolate border from photo, but MIAF
 // requires grid tiles to be at least 64x64px, and an 'iovl' overlay is
 // not valid AVIF at all, so neither renders in standard viewers.)
 const CANVAS_PIXELS: usize = WIDTH as usize * HEIGHT as usize;
+
+// Fixed upscale factor for the display-size item. 8 divides the 16px
+// coding block, so upscale block boundaries stay aligned to source pixels.
+const SCALE: u32 = 8;
+const LARGE_W: u32 = WIDTH * SCALE;
+const LARGE_H: u32 = HEIGHT * SCALE;
 
 const PHOTO_X: u32 = 16;
 const PHOTO_Y: u32 = 16;
@@ -229,6 +237,23 @@ fn render_photo(
     out
 }
 
+/// Nearest-neighbor upscale by an integer `scale` (each source pixel
+/// becomes a `scale`x`scale` block of the same value).
+fn upscale_nearest(gray: &[u8], w: u32, h: u32, scale: u32) -> Vec<u8> {
+    let (w, h, scale) = (w as usize, h as usize, scale as usize);
+    let mut out = vec![0u8; w * scale * h * scale];
+    for y in 0..h {
+        for x in 0..w {
+            let v = gray[y * w + x];
+            for dy in 0..scale {
+                let base = (y * scale + dy) * w * scale + x * scale;
+                out[base..base + scale].fill(v);
+            }
+        }
+    }
+    out
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -289,7 +314,8 @@ fn main() {
         };
 
         let gray = render_photo(rom_tuple, &save, base_address);
-        let avif = match mono::encode_gray(&gray, WIDTH, HEIGHT) {
+        let large = upscale_nearest(&gray, WIDTH, HEIGHT, SCALE);
+        let avif = match mono::encode_gray_pair(&gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("gbcamextract: couldn't encode {}: {}", slot_num, e);
