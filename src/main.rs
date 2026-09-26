@@ -344,6 +344,7 @@ fn group_rendered(rasters: Vec<(usize, Vec<u8>)>) -> Vec<RasterGroup> {
 }
 
 fn run(args: Args) -> Result<(), String> {
+    let report_rdo_stats = std::env::var_os("GBCAMEXTRACT_RDO_STATS").is_some();
     let save = std::fs::read(&args.save).map_err(|e| {
         format!(
             "couldn't open save '{}' for reading: {e}",
@@ -478,6 +479,10 @@ fn run(args: Args) -> Result<(), String> {
         groups.len(),
         30 - groups.len()
     );
+    // Per-file deltas are exact only when groups cannot interleave. The
+    // process-wide totals below remain exact with a larger Rayon pool.
+    let report_file_stats = report_rdo_stats && rayon::current_num_threads() == 1;
+    let paired_encode_nanos = std::sync::atomic::AtomicU64::new(0);
 
     // Encoding remains bounded by the configured Rayon pool. Every group is
     // encoded once and the resulting bytes are written to all of its
@@ -485,6 +490,16 @@ fn run(args: Args) -> Result<(), String> {
     groups.into_par_iter().try_for_each(|group| {
         let first_slot = group.slots[0];
         let large = upscale_nearest(&group.gray, WIDTH, HEIGHT, SCALE);
+        let before = report_file_stats.then(|| {
+            (
+                mono::rdo_stats(),
+                mono::rdo_errors(),
+                mono::pattern_cache_stats(),
+                mono::pattern_cache_stats_speculative(),
+                mono::uniform_search_stats(),
+            )
+        });
+        let encode_started = report_rdo_stats.then(std::time::Instant::now);
         let avif = mono::encode_gray_pair(&group.gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H)
             .map_err(|e| {
                 format!(
@@ -492,6 +507,48 @@ fn run(args: Args) -> Result<(), String> {
                     filenames[first_slot - 1]
                 )
             })?;
+        let paired_encode_ms = encode_started.map(|started| {
+            let elapsed = started.elapsed();
+            paired_encode_nanos.fetch_add(elapsed.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            elapsed.as_secs_f64() * 1000.0
+        });
+        if let Some((rdo0, errors0, pattern0, pattern_spec0, uniform0)) = before {
+            let (rdo1, errors1) = (mono::rdo_stats(), mono::rdo_errors());
+            let (pattern1, pattern_spec1) = (
+                mono::pattern_cache_stats(),
+                mono::pattern_cache_stats_speculative(),
+            );
+            let uniform1 = mono::uniform_search_stats();
+            let files = group
+                .slots
+                .iter()
+                .map(|&slot| filenames[slot - 1].as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "rdo-stats: files={files} bytes={} paired_ms={:.3} rdo_wins={} baseline_wins={} rdo_candidates={} rdo_errors={} pattern_committed={}/{} pattern_speculative={}/{} uniform_searches={} uniform_committed_searches={} uniform_speculative_searches={} uniform_work={} uniform_speculative_work={} uniform_fallbacks={} uniform_legal_matches={} uniform_selected={} uniform_errors={} uniform_cache_max_bytes={}",
+                avif.len(),
+                paired_encode_ms.unwrap_or_default(),
+                rdo1.0 - rdo0.0,
+                rdo1.1 - rdo0.1,
+                rdo1.2 - rdo0.2,
+                errors1 - errors0,
+                pattern1.0 - pattern0.0,
+                pattern1.1 - pattern0.1,
+                pattern_spec1.0 - pattern_spec0.0,
+                pattern_spec1.1 - pattern_spec0.1,
+                uniform1.searches - uniform0.searches,
+                uniform1.committed_searches - uniform0.committed_searches,
+                uniform1.speculative_searches - uniform0.speculative_searches,
+                uniform1.search_work - uniform0.search_work,
+                uniform1.speculative_work - uniform0.speculative_work,
+                uniform1.fallbacks - uniform0.fallbacks,
+                uniform1.legal_matches - uniform0.legal_matches,
+                uniform1.selected_copies - uniform0.selected_copies,
+                uniform1.errors - uniform0.errors,
+                uniform1.cache_bytes,
+            );
+        }
         debug_assert_eq!(group.identity, EncodeIdentity::current());
         for slot_num in group.slots {
             let filename = &filenames[slot_num - 1];
@@ -500,6 +557,32 @@ fn run(args: Args) -> Result<(), String> {
         }
         Ok::<(), String>(())
     })?;
+    if report_rdo_stats {
+        let rdo = mono::rdo_stats();
+        let (pattern_committed, pattern_fallbacks) = mono::pattern_cache_stats();
+        let (pattern_speculative, pattern_speculative_fallbacks) =
+            mono::pattern_cache_stats_speculative();
+        let uniform = mono::uniform_search_stats();
+        eprintln!(
+            "rdo-stats-total: rayon_threads={} paired_ms_sum={:.3} rdo_wins={} baseline_wins={} rdo_candidates={} rdo_errors={} pattern_committed={pattern_committed}/{pattern_fallbacks} pattern_speculative={pattern_speculative}/{pattern_speculative_fallbacks} uniform_searches={} uniform_committed_searches={} uniform_speculative_searches={} uniform_work={} uniform_speculative_work={} uniform_fallbacks={} uniform_legal_matches={} uniform_selected={} uniform_errors={} uniform_cache_max_bytes={}",
+            rayon::current_num_threads(),
+            paired_encode_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0,
+            rdo.0,
+            rdo.1,
+            rdo.2,
+            mono::rdo_errors(),
+            uniform.searches,
+            uniform.committed_searches,
+            uniform.speculative_searches,
+            uniform.search_work,
+            uniform.speculative_work,
+            uniform.fallbacks,
+            uniform.legal_matches,
+            uniform.selected_copies,
+            uniform.errors,
+            uniform.cache_bytes,
+        );
+    }
     Ok(())
 }
 

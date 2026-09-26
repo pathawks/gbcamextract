@@ -40,7 +40,20 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 
 mod intrabc;
-use intrabc::{IntrabcState, MvComp, MvRec};
+pub use intrabc::UniformSearchStats;
+use intrabc::{IntrabcState, MvComp, MvRec, UniformDecision};
+
+/// Process-wide diagnostics for the uniform 16x16 source index.
+#[allow(dead_code)]
+pub fn uniform_search_stats() -> UniformSearchStats {
+    intrabc::uniform_stats_total()
+}
+
+/// Reset uniform 16x16 source-index diagnostics.
+#[allow(dead_code)]
+pub fn reset_uniform_search_stats() {
+    intrabc::reset_uniform_stats()
+}
 
 /// Cached-search diagnostics for the 16x16 8x path: `(queries, fallbacks)`.
 /// Committed (non-speculative) searches: `queries` counts verified-image
@@ -136,7 +149,7 @@ pub fn reset_rdo_stats() {
 type MvPair = (i32, i32);
 type BcMatch = (MvPair, MvPair);
 /// Estimated cost plus the copy MV/predictor it was measured with.
-type CopyCost = (f64, BcMatch);
+type CopyCost = (f64, BcMatch, bool);
 
 /// A 64x64 superblock's contained partition tree has at most 21 nodes
 /// (64, four 32s, sixteen 16s). Plans are stack-bounded and live only for
@@ -147,7 +160,7 @@ const MAX_PLAN_NODES: usize = 21;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PlanDecision {
     Palette,
-    Copy(BcMatch),
+    Copy(BcMatch, bool),
     Split,
 }
 
@@ -896,6 +909,9 @@ impl<'a> TileEncoder<'a> {
         // images keep the original ring behavior exactly.
         if let Some(bc) = intrabc.as_mut() {
             bc.build_pattern_cache(px, w, h);
+            if use_rdo {
+                bc.build_uniform_cache(px, w, h);
+            }
         }
         let mask_w16 = w / 16;
         Ok(Self {
@@ -1249,6 +1265,31 @@ impl<'a> TileEncoder<'a> {
         match self.intrabc.as_ref() {
             Some(bc) => bc.find_match(self.px, self.w, self.h, r, c, bw4, bw4, top_has_right),
             None => None,
+        }
+    }
+
+    /// Uniform 16x16 lookup has its own exact-byte spatial index. A
+    /// nonuniform result tells callers to preserve the existing search;
+    /// uniform misses are definitive because the index covers every source
+    /// origin on the ring's 4px candidate grid.
+    fn intrabc_uniform_match(
+        &self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+    ) -> io::Result<UniformDecision> {
+        match self.intrabc.as_ref() {
+            Some(bc) => {
+                bc.find_uniform_match(self.px, self.w, self.h, r, c, bw4, bw4, top_has_right)
+            }
+            None => Ok(UniformDecision::NotUniform),
+        }
+    }
+
+    fn record_uniform_copy_selected(&mut self) {
+        if let Some(bc) = self.intrabc.as_mut() {
+            bc.record_uniform_copy_selected();
         }
     }
 
@@ -2031,43 +2072,34 @@ impl<'a> TileEncoder<'a> {
         // rejected trials leave no availability changes.
         // Evaluate palette trial (if legal).
         let pal_cost: Option<f64> = if pal_legal {
-            self.trial(r, c, bw4, bw4, |enc| {
+            Some(self.trial(r, c, bw4, bw4, |enc| {
                 let ctx = enc.partition_ctx(r, c, bsl);
                 enc.enc_part(bsl, ctx, PARTITION_NONE);
                 enc.update_partition_ctx(r, c, bsl);
                 enc.block_with_force(r, c, bsl, top_has_right, None, true)
-            })
-            .ok()
+            })?)
         } else {
             None
         };
-        // Evaluate copy trial (speculative search inside).
+        // Use the exact-byte cache for actual uniform blocks; all other
+        // blocks retain the existing nonuniform search behavior.
         let copy_trial: Option<CopyCost> = {
-            // Peek availability speculatively without mutating live? Do a
-            // speculative trial that searches then encodes; if no match,
-            // the trial `Err`s via a sentinel (use `InvalidInput` to mean
-            // "no copy", screened, not counted? Actually `trial` counts only
-            // `Ok`; we return `Err` for miss so it is not counted as a
-            // candidate — but the search work was done. For "candidates
-            // evaluated" we count only encoded candidates; misses are
-            // screened availability checks. Documented.)
-            // To get the match for the committed re-encode without a second
-            // live search, we search once non-speculatively? No — that would
-            // pollute stats on miss. Instead, search inside the trial and,
-            // on hit, record the MV for the later committed encode (which
-            // will re-search deterministically to the same MV).
-            // `intrabc_match` is read-only apart from diagnostics. Mark this
-            // availability query speculative without snapshotting encoder
-            // state or cloning the arithmetic coder.
             let outer_depth = self.speculative_depth();
             self.enter_speculative();
-            let m = self.intrabc_match(r, c, bw4, top_has_right);
+            let searched = (|| -> io::Result<(Option<BcMatch>, bool)> {
+                match self.intrabc_uniform_match(r, c, bw4, top_has_right)? {
+                    UniformDecision::Uniform(m) => Ok((m, true)),
+                    UniformDecision::NotUniform => {
+                        Ok((self.intrabc_match(r, c, bw4, top_has_right), false))
+                    }
+                }
+            })();
             self.restore_speculative(outer_depth);
-            // Now trial-encode the copy if available.
+            let (m, is_uniform) = searched?;
             match m {
                 None => None,
-                Some(mv_pred) => self
-                    .trial(r, c, bw4, bw4, |enc| {
+                Some(mv_pred) => {
+                    let cost = self.trial(r, c, bw4, bw4, |enc| {
                         let ctx = enc.partition_ctx(r, c, bsl);
                         enc.enc_part(bsl, ctx, PARTITION_NONE);
                         enc.update_partition_ctx(r, c, bsl);
@@ -2083,15 +2115,15 @@ impl<'a> TileEncoder<'a> {
                             mv_pred.1 .0,
                             mv_pred.1 .1,
                         )
-                    })
-                    .map(|d| (d, mv_pred))
-                    .ok(),
+                    })?;
+                    Some((cost, mv_pred, is_uniform))
+                }
             }
         };
         // Decide (tie → palette, earliest in order, deterministic).
         const EPS: f64 = 1e-9;
         let use_palette = match (pal_cost, copy_trial) {
-            (Some(pc), Some((cc, _))) => cc >= pc - EPS,
+            (Some(pc), Some((cc, _, _))) => cc >= pc - EPS,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => {
@@ -2118,7 +2150,7 @@ impl<'a> TileEncoder<'a> {
                 plan.push(PlanDecision::Palette);
             }
         } else {
-            let (_, mv_pred) = copy_trial.expect("copy must exist when chosen");
+            let (_, mv_pred, uniform_copy) = copy_trial.expect("copy must exist when chosen");
             let ctx = self.partition_ctx(r, c, bsl);
             self.enc_part(bsl, ctx, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
@@ -2134,8 +2166,11 @@ impl<'a> TileEncoder<'a> {
                 mv_pred.1 .0,
                 mv_pred.1 .1,
             )?;
+            if uniform_copy {
+                self.record_uniform_copy_selected();
+            }
             if let Some(plan) = plan {
-                plan.push(PlanDecision::Copy(mv_pred));
+                plan.push(PlanDecision::Copy(mv_pred, uniform_copy));
             }
         }
         Ok(())
@@ -2275,29 +2310,28 @@ impl<'a> TileEncoder<'a> {
         // IntraBC-enabled: palette (if legal), copy (if available), split.
         let pal_legal = self.palette_legal(r, c, bw4);
         let pal_cost: Option<f64> = if pal_legal {
-            self.trial(r, c, bw4, bw4, |enc| {
+            Some(self.trial(r, c, bw4, bw4, |enc| {
                 let ctx = enc.partition_ctx(r, c, bsl);
                 enc.enc_part(bsl, ctx, PARTITION_NONE);
                 enc.update_partition_ctx(r, c, bsl);
                 enc.block_with_force(r, c, bsl, top_has_right, None, true)
-            })
-            .ok()
+            })?)
         } else {
             None
         };
         // Copy availability via speculative peek (no live mutation), then
         // trial-encode if available.
-        let copy_info: Option<BcMatch> = {
+        let copy_info: Option<(BcMatch, bool)> = {
             let outer_depth = self.speculative_depth();
             self.enter_speculative();
             let m = self.intrabc_match(r, c, bw4, top_has_right);
             self.restore_speculative(outer_depth);
-            m
+            m.map(|mv_pred| (mv_pred, false))
         };
         let copy_cost: Option<CopyCost> = match copy_info {
             None => None,
-            Some(mv_pred) => self
-                .trial(r, c, bw4, bw4, |enc| {
+            Some((mv_pred, is_uniform)) => {
+                let cost = self.trial(r, c, bw4, bw4, |enc| {
                     let ctx = enc.partition_ctx(r, c, bsl);
                     enc.enc_part(bsl, ctx, PARTITION_NONE);
                     enc.update_partition_ctx(r, c, bsl);
@@ -2313,9 +2347,9 @@ impl<'a> TileEncoder<'a> {
                         mv_pred.1 .0,
                         mv_pred.1 .1,
                     )
-                })
-                .map(|d| (d, mv_pred))
-                .ok(),
+                })?;
+                Some((cost, mv_pred, is_uniform))
+            }
         };
         let mut split_plan = PartitionPlan::new();
         let split_cost: Option<f64> = match self.trial(r, c, bw4, bw4, |enc| {
@@ -2371,7 +2405,7 @@ impl<'a> TileEncoder<'a> {
         }
         let mut best = Pick::Split;
         let mut best_cost = split_cost.expect("split must succeed");
-        if let Some((cc, _)) = copy_cost {
+        if let Some((cc, _, _)) = copy_cost {
             if cc < best_cost + EPS {
                 best = Pick::Copy;
                 best_cost = cc;
@@ -2404,7 +2438,7 @@ impl<'a> TileEncoder<'a> {
                 Self::record_plan(&mut plan, PlanDecision::Palette);
             }
             Pick::Copy => {
-                let (_, mv_pred) = copy_cost.expect("copy must exist when chosen");
+                let (_, mv_pred, uniform_copy) = copy_cost.expect("copy must exist when chosen");
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
@@ -2420,7 +2454,10 @@ impl<'a> TileEncoder<'a> {
                     mv_pred.1 .0,
                     mv_pred.1 .1,
                 )?;
-                Self::record_plan(&mut plan, PlanDecision::Copy(mv_pred));
+                if uniform_copy {
+                    self.record_uniform_copy_selected();
+                }
+                Self::record_plan(&mut plan, PlanDecision::Copy(mv_pred, uniform_copy));
             }
             Pick::Split => {
                 let ctx = self.partition_ctx(r, c, bsl);
@@ -2494,7 +2531,7 @@ impl<'a> TileEncoder<'a> {
                 self.update_partition_ctx(r, c, bsl);
                 self.block_with_force(r, c, bsl, top_has_right, None, true)?;
             }
-            PlanDecision::Copy(mv_pred) => {
+            PlanDecision::Copy(mv_pred, uniform_copy) => {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
@@ -2510,6 +2547,9 @@ impl<'a> TileEncoder<'a> {
                     mv_pred.1 .0,
                     mv_pred.1 .1,
                 )?;
+                if uniform_copy {
+                    self.record_uniform_copy_selected();
+                }
             }
             PlanDecision::Split => {
                 let ctx = self.partition_ctx(r, c, bsl);
@@ -4285,6 +4325,48 @@ mod tests {
             super::rdo_errors(),
             errs_before,
             "ordinary tie must not count as RDO error"
+        );
+    }
+
+    #[test]
+    fn rdo_uniform_copy_uses_exact_gray_and_rejected_nested_trial_stays_speculative() {
+        use super::TileEncoder;
+        let (w, h) = (512usize, 64usize);
+        let pixels = vec![37u8; w * h];
+        let (_, masks) = validate_gray(&pixels, w as u32, h as u32).unwrap();
+
+        let mut enc = TileEncoder::new_with_rdo(&pixels, w, h, true, masks.clone(), true).unwrap();
+        enc.intrabc.as_mut().unwrap().record(0, 0, 4, 4, None);
+        let before = enc.intrabc.as_ref().unwrap().uniform_stats();
+        enc.trial(0, 80, 4, 4, |e| e.rdo_leaf_with_plan(0, 80, 2, true, None))
+            .unwrap();
+        let rejected = enc.intrabc.as_ref().unwrap().uniform_stats();
+        assert_eq!(
+            rejected.committed_searches, before.committed_searches,
+            "rejected nested trial must not claim a committed search"
+        );
+        assert!(
+            rejected.speculative_work > before.speculative_work,
+            "nested RDO trial must expose its candidate search work"
+        );
+        assert_eq!(
+            rejected.selected_copies, before.selected_copies,
+            "rejected trial must not count its local uniform-copy choice"
+        );
+
+        enc.rdo_leaf_with_plan(0, 80, 2, true, None).unwrap();
+        let committed = enc.intrabc.as_ref().unwrap().uniform_stats();
+        assert_eq!(
+            committed.selected_copies, 1,
+            "RDO should choose the low-cost copy"
+        );
+        assert!(committed.legal_matches > rejected.legal_matches);
+
+        let mut palette = TileEncoder::new_with_rdo(&pixels, w, h, false, masks, true).unwrap();
+        palette.rdo_leaf_with_plan(0, 80, 2, true, None).unwrap();
+        assert!(
+            palette.intrabc.is_none(),
+            "palette-only mode disables IntraBC"
         );
     }
 

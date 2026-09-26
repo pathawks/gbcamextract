@@ -18,6 +18,7 @@
 use super::{adapt_bits, AdaptCdf};
 use gamut_bitstream::SymbolEncoder;
 use std::cell::Cell;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -167,6 +168,72 @@ const INTRABC_DELAY_SB64: i64 = 4;
 /// `1 + INTRABC_DELAY_SB64 + use_128x128_superblock`; this encoder always
 /// uses 64px superblocks (`use_128x128_superblock = 0`), so the gradient is 5.
 const INTRABC_GRADIENT: i64 = 1 + INTRABC_DELAY_SB64;
+
+/// Work and outcomes for exact-gray uniform 16x16 source lookup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UniformSearchStats {
+    /// Eligible uniform searches across committed and speculative contexts.
+    pub searches: u64,
+    /// Eligible uniform searches made inside an RDO trial.
+    pub speculative_searches: u64,
+    /// Candidate positions checked across committed and speculative searches.
+    pub search_work: u64,
+    /// Candidate positions checked while inside one or more RDO trials.
+    pub speculative_work: u64,
+    /// Eligible uniform queries made outside an RDO trial.
+    pub committed_searches: u64,
+    /// Uniform searches with at least one source passing all legality checks.
+    pub legal_matches: u64,
+    /// Nonuniform 16x16 leaves delegated to the unchanged ring search.
+    pub fallbacks: u64,
+    /// Uniform copies selected by committed RDO decisions.
+    pub selected_copies: u64,
+    /// Unexpected errors raised by the uniform lookup path.
+    pub errors: u64,
+    /// Retained candidate-index storage for one image.
+    pub cache_bytes: u64,
+}
+
+static UNIFORM_SEARCH_WORK: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_SPECULATIVE_WORK: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_SEARCHES: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_SPECULATIVE_SEARCHES: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_COMMITTED_SEARCHES: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_LEGAL_MATCHES: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_SELECTED_COPIES: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_ERRORS: AtomicU64 = AtomicU64::new(0);
+static UNIFORM_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide uniform lookup totals for benchmarks and extraction stats.
+pub fn uniform_stats_total() -> UniformSearchStats {
+    UniformSearchStats {
+        searches: UNIFORM_SEARCHES.load(Ordering::Relaxed),
+        speculative_searches: UNIFORM_SPECULATIVE_SEARCHES.load(Ordering::Relaxed),
+        search_work: UNIFORM_SEARCH_WORK.load(Ordering::Relaxed),
+        speculative_work: UNIFORM_SPECULATIVE_WORK.load(Ordering::Relaxed),
+        committed_searches: UNIFORM_COMMITTED_SEARCHES.load(Ordering::Relaxed),
+        legal_matches: UNIFORM_LEGAL_MATCHES.load(Ordering::Relaxed),
+        fallbacks: UNIFORM_FALLBACKS.load(Ordering::Relaxed),
+        selected_copies: UNIFORM_SELECTED_COPIES.load(Ordering::Relaxed),
+        errors: UNIFORM_ERRORS.load(Ordering::Relaxed),
+        cache_bytes: UNIFORM_CACHE_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset process-wide uniform lookup diagnostics.
+pub fn reset_uniform_stats() {
+    UNIFORM_SEARCH_WORK.store(0, Ordering::Relaxed);
+    UNIFORM_SPECULATIVE_WORK.store(0, Ordering::Relaxed);
+    UNIFORM_SEARCHES.store(0, Ordering::Relaxed);
+    UNIFORM_SPECULATIVE_SEARCHES.store(0, Ordering::Relaxed);
+    UNIFORM_COMMITTED_SEARCHES.store(0, Ordering::Relaxed);
+    UNIFORM_LEGAL_MATCHES.store(0, Ordering::Relaxed);
+    UNIFORM_FALLBACKS.store(0, Ordering::Relaxed);
+    UNIFORM_SELECTED_COPIES.store(0, Ordering::Relaxed);
+    UNIFORM_ERRORS.store(0, Ordering::Relaxed);
+    UNIFORM_CACHE_BYTES.store(0, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Domain-specific cached search for 16x16 blocks on the verified 8x
@@ -371,6 +438,99 @@ impl PatternCache {
     }
 }
 
+/// Exact-byte index of every MI-aligned 16x16 uniform rectangle. Origins
+/// are stored at 4px steps, matching every source position the existing
+/// IntraBC ring can visit. Each entry stores the exact 8-bit sample and a
+/// presence bit; causal availability and AV1 MV legality are checked again
+/// for every query.
+struct UniformCache {
+    verified: bool,
+    w: usize,
+    h: usize,
+    grid_cols: usize,
+    grid_rows: usize,
+    values: Vec<u8>,
+    present: Vec<u64>,
+    searches: Cell<u64>,
+    speculative_searches: Cell<u64>,
+    search_work: Cell<u64>,
+    speculative_work: Cell<u64>,
+    committed_searches: Cell<u64>,
+    legal_matches: Cell<u64>,
+    fallbacks: Cell<u64>,
+    selected_copies: Cell<u64>,
+    errors: Cell<u64>,
+}
+
+impl UniformCache {
+    fn empty() -> Self {
+        Self {
+            verified: false,
+            w: 0,
+            h: 0,
+            grid_cols: 0,
+            grid_rows: 0,
+            values: Vec::new(),
+            present: Vec::new(),
+            searches: Cell::new(0),
+            speculative_searches: Cell::new(0),
+            search_work: Cell::new(0),
+            speculative_work: Cell::new(0),
+            committed_searches: Cell::new(0),
+            legal_matches: Cell::new(0),
+            fallbacks: Cell::new(0),
+            selected_copies: Cell::new(0),
+            errors: Cell::new(0),
+        }
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.values.len() * std::mem::size_of::<u8>()
+            + self.present.len() * std::mem::size_of::<u64>()
+    }
+
+    fn contains(&self, value: u8, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x % 4 != 0 || y % 4 != 0 {
+            return false;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if x + 16 > self.w || y + 16 > self.h {
+            return false;
+        }
+        let (gx, gy) = (x / 4, y / 4);
+        if gx >= self.grid_cols || gy >= self.grid_rows {
+            return false;
+        }
+        let index = gy * self.grid_cols + gx;
+        self.present
+            .get(index / 64)
+            .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+            && self.values.get(index) == Some(&value)
+    }
+
+    #[allow(dead_code)]
+    fn stats(&self) -> UniformSearchStats {
+        UniformSearchStats {
+            searches: self.searches.get(),
+            speculative_searches: self.speculative_searches.get(),
+            search_work: self.search_work.get(),
+            speculative_work: self.speculative_work.get(),
+            committed_searches: self.committed_searches.get(),
+            legal_matches: self.legal_matches.get(),
+            fallbacks: self.fallbacks.get(),
+            selected_copies: self.selected_copies.get(),
+            errors: self.errors.get(),
+            cache_bytes: self.memory_bytes() as u64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UniformDecision {
+    NotUniform,
+    Uniform(Option<BcMatch>),
+}
+
 pub struct IntrabcState {
     flag: AdaptCdf,
     joint: AdaptCdf,
@@ -380,6 +540,7 @@ pub struct IntrabcState {
     pub(super) rec: Vec<MvRec>,
     pub(super) decoded: Vec<bool>,
     pattern: PatternCache,
+    uniform: UniformCache,
     /// Nesting-aware speculative depth (see `is_speculative`): trials push
     /// depth so rejected candidates increment speculative (not committed)
     /// diagnostics; the winning re-encode runs at the enclosing depth so
@@ -405,8 +566,303 @@ impl IntrabcState {
             rec: vec![blank; cols * rows],
             decoded: vec![false; cols * rows],
             pattern: PatternCache::empty(),
+            uniform: UniformCache::empty(),
             speculative: 0,
         }
+    }
+
+    /// Return the byte value only when every actual sample in the
+    /// 16x16 rectangle is identical. This deliberately does not infer
+    /// uniformity from the 8x8 source-cell pattern or from palette levels.
+    fn uniform_16_value(px: &[u8], img_w: usize, img_h: usize, x: usize, y: usize) -> Option<u8> {
+        if x.checked_add(16)? > img_w || y.checked_add(16)? > img_h {
+            return None;
+        }
+        let value = *px.get(y.checked_mul(img_w)?.checked_add(x)?)?;
+        for dy in 0..16 {
+            let start = (y + dy).checked_mul(img_w)?.checked_add(x)?;
+            let row = px.get(start..start.checked_add(16)?)?;
+            if row.iter().any(|&sample| sample != value) {
+                return None;
+            }
+        }
+        Some(value)
+    }
+
+    /// Build an exact-byte membership index for every 4px-aligned source
+    /// origin. It covers the complete candidate grid used by
+    /// `find_match_ring`; the later ring walk has no arbitrary radius cap.
+    pub(super) fn build_uniform_cache(&mut self, px: &[u8], img_w: usize, img_h: usize) {
+        self.uniform = UniformCache::empty();
+        if img_w < 16
+            || img_h < 16
+            || img_w > u16::MAX as usize + 1
+            || img_h > u16::MAX as usize + 1
+        {
+            return;
+        }
+        let Some(area) = img_w.checked_mul(img_h) else {
+            return;
+        };
+        if px.len() != area {
+            return;
+        }
+
+        let grid_cols = (img_w - 16) / 4 + 1;
+        let grid_rows = (img_h - 16) / 4 + 1;
+        let Some(origins) = grid_cols.checked_mul(grid_rows) else {
+            return;
+        };
+        let mut values = vec![0u8; origins];
+        let mut present = vec![0u64; origins.div_ceil(64)];
+        for gy in 0..grid_rows {
+            let y = gy * 4;
+            for gx in 0..grid_cols {
+                let x = gx * 4;
+                if let Some(value) = Self::uniform_16_value(px, img_w, img_h, x, y) {
+                    let index = gy * grid_cols + gx;
+                    values[index] = value;
+                    present[index / 64] |= 1u64 << (index % 64);
+                }
+            }
+        }
+        let cache = UniformCache {
+            verified: true,
+            w: img_w,
+            h: img_h,
+            grid_cols,
+            grid_rows,
+            values,
+            present,
+            ..UniformCache::empty()
+        };
+        UNIFORM_CACHE_BYTES.fetch_max(cache.memory_bytes() as u64, Ordering::Relaxed);
+        self.uniform = cache;
+    }
+
+    /// Per-image uniform-cache counters, useful for isolated tests.
+    #[allow(dead_code)]
+    pub fn uniform_stats(&self) -> UniformSearchStats {
+        self.uniform.stats()
+    }
+
+    fn record_uniform_fallback(&self) {
+        self.uniform.fallbacks.set(self.uniform.fallbacks.get() + 1);
+        UNIFORM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a chosen uniform copy only when it is replayed at committed
+    /// depth. Decisions made inside a rejected enclosing trial are omitted.
+    pub(super) fn record_uniform_copy_selected(&mut self) {
+        if !self.is_speculative() {
+            self.uniform
+                .selected_copies
+                .set(self.uniform.selected_copies.get() + 1);
+            UNIFORM_SELECTED_COPIES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Find the nearest legal source among all exact-byte uniform 16x16
+    /// blocks. `NotUniform` leaves the original nonuniform search untouched;
+    /// `Uniform(None)` means the block is uniform but has no legal source.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn find_uniform_match(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        bh4: usize,
+        top_has_right: bool,
+    ) -> io::Result<UniformDecision> {
+        let fail = |kind, message: String| {
+            self.uniform.errors.set(self.uniform.errors.get() + 1);
+            UNIFORM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            io::Error::new(kind, message)
+        };
+        if bw4 != 4 || bh4 != 4 {
+            self.record_uniform_fallback();
+            return Ok(UniformDecision::NotUniform);
+        }
+        let Some(area) = img_w.checked_mul(img_h) else {
+            return Err(fail(
+                io::ErrorKind::InvalidInput,
+                format!("uniform IntraBC image area overflows: {img_w}x{img_h}"),
+            ));
+        };
+        if px.len() != area
+            || !self.uniform.verified
+            || self.uniform.w != img_w
+            || self.uniform.h != img_h
+        {
+            return Err(fail(
+                io::ErrorKind::InvalidInput,
+                "uniform IntraBC cache does not match the source image".to_owned(),
+            ));
+        }
+        let (Some(sx), Some(sy)) = (c.checked_mul(4), r.checked_mul(4)) else {
+            return Err(fail(
+                io::ErrorKind::InvalidInput,
+                "uniform IntraBC block coordinate overflows".to_owned(),
+            ));
+        };
+        let Some(value) = Self::uniform_16_value(px, img_w, img_h, sx, sy) else {
+            if sx.checked_add(16).is_none_or(|end| end > img_w)
+                || sy.checked_add(16).is_none_or(|end| end > img_h)
+            {
+                return Err(fail(
+                    io::ErrorKind::InvalidInput,
+                    format!("uniform IntraBC query outside image at ({sx},{sy})"),
+                ));
+            }
+            self.record_uniform_fallback();
+            return Ok(UniformDecision::NotUniform);
+        };
+
+        let speculative = self.is_speculative();
+        if speculative {
+            self.uniform
+                .speculative_searches
+                .set(self.uniform.speculative_searches.get() + 1);
+            UNIFORM_SPECULATIVE_SEARCHES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.uniform
+                .committed_searches
+                .set(self.uniform.committed_searches.get() + 1);
+            UNIFORM_COMMITTED_SEARCHES.fetch_add(1, Ordering::Relaxed);
+        }
+        self.uniform.searches.set(self.uniform.searches.get() + 1);
+        UNIFORM_SEARCHES.fetch_add(1, Ordering::Relaxed);
+
+        let sx = sx as i32;
+        let sy = sy as i32;
+        let (sbx, sby) = ((c as i32 / 16) * 64, (r as i32 / 16) * 64);
+        let ((py, px_pred), ok) = self.predictor(r, c, 4, 4, top_has_right);
+        if !ok {
+            return Ok(UniformDecision::Uniform(None));
+        }
+        let total_sb64_per_row = (((self.cols as i32 - 1) >> 4) + 1) as i64;
+        let active_sb_row = (sy / 64) as i64;
+        let active_sb64_col = (sx >> 6) as i64;
+        let active_sb64 = active_sb_row * total_sb64_per_row + active_sb64_col;
+        let (pred_x, pred_y) = (sx + px_pred / 8, sy + py / 8);
+        // Any legal 16x16 source must fit within the frame and the strict
+        // AV1 MV bound (|component| < 16384 in 1/8-pel units). On the 4px
+        // grid the furthest possible displacement is therefore 2044px.
+        let mv_min_x = 0.max(sx - 2044);
+        let mv_max_x = ((img_w - 16) as i32).min(sx + 2044);
+        let mv_min_y = 0.max(sy - 2044);
+        let mv_max_y = ((img_h - 16) as i32).min(sy + 2044);
+        let mut regions = [(0i32, -1i32, 0i32, -1i32); 2];
+        let mut region_count = 0;
+        // The existing conservative SB-overlap rule permits only a source
+        // fully above this SB or in its same-row slab strictly to the left.
+        if sby >= 16 {
+            let y_max = mv_max_y.min(sby - 16);
+            if mv_min_x <= mv_max_x && mv_min_y <= y_max {
+                regions[region_count] = (mv_min_x, mv_max_x, mv_min_y, y_max);
+                region_count += 1;
+            }
+        }
+        if sbx >= 16 {
+            let x_max = mv_max_x.min(sbx - 16);
+            let y_min = mv_min_y.max(sby);
+            let y_max = mv_max_y.min(sby + 48);
+            if mv_min_x <= x_max && y_min <= y_max {
+                regions[region_count] = (mv_min_x, x_max, y_min, y_max);
+                region_count += 1;
+            }
+        }
+        if region_count == 0 {
+            return Ok(UniformDecision::Uniform(None));
+        }
+        let mut max_distance = 0i32;
+        for &(x_min, x_max, y_min, y_max) in &regions[..region_count] {
+            for (x, y) in [
+                (x_min, y_min),
+                (x_min, y_max),
+                (x_max, y_min),
+                (x_max, y_max),
+            ] {
+                max_distance = max_distance.max((x - pred_x).abs().max((y - pred_y).abs()));
+            }
+        }
+        // Search every ring that can intersect the legal frame/MV/overlap
+        // region. This extends the legacy 256px radius without truncating
+        // any legal uniform source and stops as soon as the first ring-order
+        // match is found.
+        let max_ring = (max_distance + MATCH_STEP - 1) / MATCH_STEP;
+        let probe = |x0: i32, y0: i32| -> Option<(i32, i32)> {
+            if !regions[..region_count]
+                .iter()
+                .any(|&(x_min, x_max, y_min, y_max)| {
+                    (x_min..=x_max).contains(&x0) && (y_min..=y_max).contains(&y0)
+                })
+            {
+                return None;
+            }
+            self.uniform
+                .search_work
+                .set(self.uniform.search_work.get() + 1);
+            UNIFORM_SEARCH_WORK.fetch_add(1, Ordering::Relaxed);
+            if speculative {
+                self.uniform
+                    .speculative_work
+                    .set(self.uniform.speculative_work.get() + 1);
+                UNIFORM_SPECULATIVE_WORK.fetch_add(1, Ordering::Relaxed);
+            }
+            if !self.uniform.contains(value, x0, y0) {
+                return None;
+            }
+            let (my, mx) = ((y0 - sy) * 8, (x0 - sx) * 8);
+            self.probe_candidate_at(
+                px,
+                img_w,
+                img_h,
+                sx,
+                sy,
+                16,
+                16,
+                sbx,
+                sby,
+                total_sb64_per_row,
+                active_sb_row,
+                active_sb64,
+                active_sb64_col,
+                [value; 5],
+                my,
+                mx,
+            )?;
+            self.uniform
+                .legal_matches
+                .set(self.uniform.legal_matches.get() + 1);
+            UNIFORM_LEGAL_MATCHES.fetch_add(1, Ordering::Relaxed);
+            Some((my, mx))
+        };
+        if let Some(mv) = probe(pred_x, pred_y) {
+            return Ok(UniformDecision::Uniform(Some((mv, (py, px_pred)))));
+        }
+        for k in 1..=max_ring {
+            let step = k * MATCH_STEP;
+            for i in -k..=k {
+                let offset = i * MATCH_STEP;
+                for (dx, dy) in [(offset, -step), (offset, step)] {
+                    if let Some(mv) = probe(pred_x + dx, pred_y + dy) {
+                        return Ok(UniformDecision::Uniform(Some((mv, (py, px_pred)))));
+                    }
+                }
+                if i != -k && i != k {
+                    for (dx, dy) in [(-step, offset), (step, offset)] {
+                        if let Some(mv) = probe(pred_x + dx, pred_y + dy) {
+                            return Ok(UniformDecision::Uniform(Some((mv, (py, px_pred)))));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(UniformDecision::Uniform(None))
     }
 
     /// Verify the 8x nearest-neighbor invariant at the image boundary and,
@@ -1491,7 +1947,24 @@ mod tests {
     fn state_for(px: &[u8], w: usize, h: usize) -> IntrabcState {
         let mut st = IntrabcState::new(w / 4, h / 4);
         st.build_pattern_cache(px, w, h);
+        st.build_uniform_cache(px, w, h);
         st
+    }
+
+    fn constant_image(w: usize, h: usize, value: u8) -> Vec<u8> {
+        vec![value; w * h]
+    }
+
+    fn uniform_query(
+        st: &IntrabcState,
+        px: &[u8],
+        w: usize,
+        h: usize,
+        x: usize,
+        y: usize,
+    ) -> UniformDecision {
+        st.find_uniform_match(px, w, h, y / 4, x / 4, 4, 4, true)
+            .unwrap()
     }
 
     /// Drive 16x16 queries in row-major decode order, comparing the cached
@@ -1679,6 +2152,144 @@ mod tests {
         assert_eq!(a, b);
         let fb = st2.pattern_fallbacks();
         assert!(fb >= 1, "uniform must fall back");
+    }
+
+    #[test]
+    fn uniform_exact_byte_matches_black_white_shades_and_arbitrary_gray() {
+        for value in [0, 85, 170, 255, 37] {
+            let (w, h) = (512, 64);
+            let px = constant_image(w, h, value);
+            let mut st = state_for(&px, w, h);
+            st.record(0, 0, 4, 4, None);
+            let found = uniform_query(&st, &px, w, h, 320, 0);
+            assert_eq!(
+                found,
+                UniformDecision::Uniform(Some(((0, -2560), (0, -2560)))),
+                "exact-byte source lookup for gray {value}"
+            );
+            assert_eq!(st.uniform_stats().committed_searches, 1);
+            assert!(st.uniform_stats().legal_matches >= 1);
+        }
+    }
+
+    #[test]
+    fn uniform_index_does_not_alias_different_arbitrary_gray_values() {
+        let (w, h) = (512, 64);
+        let mut px = constant_image(w, h, 38);
+        px[..16].fill(37);
+        for row in 0..16 {
+            px[row * w..row * w + 16].fill(37);
+        }
+        let mut st = state_for(&px, w, h);
+        assert!(!st.pattern_verified(), "arbitrary gray must use fallback");
+        st.record(0, 0, 4, 4, None);
+        assert_eq!(
+            uniform_query(&st, &px, w, h, 320, 0),
+            UniformDecision::Uniform(None),
+            "gray 38 must not reuse the gray 37 source"
+        );
+        let stats = st.uniform_stats();
+        assert_eq!(stats.searches, 1);
+        assert_eq!(stats.legal_matches, 0);
+    }
+
+    #[test]
+    fn uniform_search_errors_are_reported_separately_from_misses() {
+        let (w, h) = (512, 64);
+        let px = constant_image(w, h, 85);
+        let st = state_for(&px, w, h);
+        assert!(st
+            .find_uniform_match(&px[..px.len() - 1], w, h, 0, 80, 4, 4, true)
+            .is_err());
+        let stats = st.uniform_stats();
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.searches, 0, "an invalid call is not an ordinary miss");
+        assert_eq!(stats.fallbacks, 0);
+    }
+
+    #[test]
+    fn uniform_eligibility_checks_all_256_samples_and_nonuniform_falls_back() {
+        let (w, h) = (512, 64);
+        let mut px = constant_image(w, h, 0);
+        // Keep the four corners equal while changing an interior sample.
+        px[3 * w + 7] = 1;
+        let st = state_for(&px, w, h);
+        assert!(!st.pattern_verified());
+        assert_eq!(
+            uniform_query(&st, &px, w, h, 0, 0),
+            UniformDecision::NotUniform,
+            "eligibility must scan actual grayscale samples"
+        );
+        let cached = st.find_match(&px, w, h, 0, 0, 4, 4, true);
+        let oracle = st.find_match_ring(&px, w, h, 0, 0, 4, 4, true);
+        assert_eq!(
+            cached, oracle,
+            "arbitrary-gray nonuniform path is unchanged"
+        );
+    }
+
+    #[test]
+    fn uniform_search_finds_long_range_border_copy_beyond_ring_limit() {
+        let (w, h) = (1024, 64);
+        let px = constant_image(w, h, 255);
+        let mut st = state_for(&px, w, h);
+        st.record(0, 0, 4, 4, None);
+        let found = uniform_query(&st, &px, w, h, 768, 0);
+        assert!(
+            matches!(found, UniformDecision::Uniform(Some(_))),
+            "a legal repeated border source may be beyond the legacy 256px ring"
+        );
+        assert_eq!(
+            st.find_match_ring(&px, w, h, 0, 192, 4, 4, true),
+            None,
+            "legacy nonuniform/ring search remains radius bounded"
+        );
+    }
+
+    #[test]
+    fn uniform_search_rejects_unavailable_and_future_sources_at_edges() {
+        let (w, h) = (512, 64);
+        let px = constant_image(w, h, 85);
+        let st = state_for(&px, w, h);
+        assert_eq!(
+            uniform_query(&st, &px, w, h, 320, 0),
+            UniformDecision::Uniform(None),
+            "matching pixels are not enough before reconstruction"
+        );
+
+        let mut future = state_for(&px, w, h);
+        future.record(0, 100, 4, 4, None); // x=400, to the right of x=320.
+        assert_eq!(
+            uniform_query(&future, &px, w, h, 320, 0),
+            UniformDecision::Uniform(None),
+            "even a marked future/right-side source is rejected by AV1 legality"
+        );
+
+        let mut edge = state_for(&px, w, h);
+        edge.record(0, 0, 4, 4, None);
+        assert!(
+            matches!(
+                uniform_query(&edge, &px, w, h, 496, 0),
+                UniformDecision::Uniform(Some(_))
+            ),
+            "the last in-frame 16x16 block can copy from the single tile's left edge"
+        );
+        assert!(
+            edge.uniform_stats().cache_bytes > 257 * 4,
+            "the MI-aligned exact-gray index must retain candidate positions"
+        );
+    }
+
+    #[test]
+    fn uniform_cache_preserves_four_pixel_aligned_ring_sources() {
+        let (w, h) = (512, 64);
+        let px = constant_image(w, h, 170);
+        let mut st = state_for(&px, w, h);
+        st.record(0, 1, 4, 4, None); // x=4, not a 16px-aligned origin.
+        let indexed = uniform_query(&st, &px, w, h, 320, 0);
+        let ring = st.find_match_ring(&px, w, h, 0, 80, 4, 4, true);
+        assert_eq!(indexed, UniformDecision::Uniform(ring));
+        assert_eq!(ring.map(|((_, mx), _)| mx / 8), Some(-316));
     }
 
     #[test]

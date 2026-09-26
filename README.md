@@ -20,7 +20,8 @@ blurry-interpolating the tiny original. Both rasters are written by
 a purpose-built lossless AV1 encoder (`src/mono.rs`): cost-based 64x64/32x32/16x16
 partitions (NONE+palette, NONE+IntraBC copy where available, or SPLIT with
 recursively chosen children, ranked by fractional-bit estimates; 16x16 leaves
-compare palette vs copy), each block coded `skip` with DC prediction plus a small luma
+compare palette vs copy, including an exact-byte lookup for genuinely uniform
+blocks), each block coded `skip` with DC prediction plus a small luma
 palette holding the block's exact colors (reusing the neighbours' palette
 cache), or — where an exact copy exists in already-decoded area — as an
 IntraBC block copy with an integer motion vector and no residuals. CDFs
@@ -30,6 +31,11 @@ the old 2-bit PNG sizes. Layered output (border
 as background, photo as overlay) is not used: an `iovl` overlay is not
 valid AVIF, and AVIF grids require tiles of at least 64x64px, so neither
 renders in standard viewers.
+
+Set `GBCAMEXTRACT_RDO_STATS=1` to print per-output and process-wide RDO,
+IntraBC search, fallback, selection, error, and uniform-cache memory counts.
+Per-output deltas are reported with a one-thread Rayon pool; aggregate counts
+are reported at any thread count.
 
 ## Building
 
