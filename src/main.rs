@@ -149,12 +149,7 @@ fn decode_gb_tile(raw: &[u8; 16]) -> [u8; 64] {
 /// (`bx` in 0..20, `by` in 0..18), or `None` for the photo area.
 /// Corners belong to the top/bottom strips, matching the historical draw
 /// order (sides first, top/bottom over them).
-fn border_raw_tile(
-    rom: &[u8],
-    frame: &FrameInfo,
-    bx: usize,
-    by: usize,
-) -> Option<[u8; 16]> {
+fn border_raw_tile(rom: &[u8], frame: &FrameInfo, bx: usize, by: usize) -> Option<[u8; 16]> {
     let x = bx * 8;
     let y = by * 8;
     let map_off = if (16..128).contains(&y) && !(16..144).contains(&x) {
@@ -198,8 +193,7 @@ fn canvas_block(
 ) -> [u8; 64] {
     let x = (bx * 8) as u32;
     let y = (by * 8) as u32;
-    if (PHOTO_X..PHOTO_X + PHOTO_W).contains(&x) && (PHOTO_Y..PHOTO_Y + PHOTO_H).contains(&y)
-    {
+    if (PHOTO_X..PHOTO_X + PHOTO_W).contains(&x) && (PHOTO_Y..PHOTO_Y + PHOTO_H).contains(&y) {
         let i = ((x - PHOTO_X) / 8) as usize;
         let j = ((y - PHOTO_Y) / 8) as usize;
         let off = base_address + j * 256 + i * 16;
@@ -218,11 +212,7 @@ fn canvas_block(
 }
 
 /// Full-canvas 8-bit gray pixels, row-major.
-fn render_photo(
-    rom: Option<(&[u8], &FrameInfo)>,
-    save: &[u8],
-    base_address: usize,
-) -> Vec<u8> {
+fn render_photo(rom: Option<(&[u8], &FrameInfo)>, save: &[u8], base_address: usize) -> Vec<u8> {
     let mut out = vec![0u8; CANVAS_PIXELS];
     for by in 0..18 {
         for bx in 0..20 {
@@ -256,8 +246,12 @@ fn upscale_nearest(gray: &[u8], w: u32, h: u32, scale: u32) -> Vec<u8> {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let save = std::fs::read(&args.save)
-        .map_err(|e| format!("couldn't open save '{}' for reading: {e}", args.save.display()))?;
+    let save = std::fs::read(&args.save).map_err(|e| {
+        format!(
+            "couldn't open save '{}' for reading: {e}",
+            args.save.display()
+        )
+    })?;
     if save.len() != SAVE_SIZE {
         return Err(format!(
             "save '{}' has weird size: expected {SAVE_SIZE} bytes, got {}",
@@ -274,9 +268,8 @@ fn run(args: Args) -> Result<(), String> {
 
     let rom: Option<Vec<u8>> = match &args.rom {
         Some(path) => {
-            let data = std::fs::read(path).map_err(|e| {
-                format!("couldn't open rom '{}' for reading: {e}", path.display())
-            })?;
+            let data = std::fs::read(path)
+                .map_err(|e| format!("couldn't open rom '{}' for reading: {e}", path.display()))?;
             if data.len() != ROM_SIZE {
                 return Err(format!(
                     "rom '{}' has weird size: expected {ROM_SIZE} bytes, got {}",
@@ -356,16 +349,14 @@ fn run(args: Args) -> Result<(), String> {
     // (no search-ring/index/cache heaps), so peak memory stays flat.
     (1..31usize).into_par_iter().try_for_each(|slot_num| {
         let base_address = slot_num_to_base_address(slot_num);
-        let frame_number = *save
-            .get(base_address + 0xfb0)
-            .ok_or_else(|| {
-                format!(
-                    "save '{}': slot {slot_num} frame offset {:#x} out of bounds (save len {})",
-                    args.save.display(),
-                    base_address + 0xfb0,
-                    save.len()
-                )
-            })? as i32;
+        let frame_number = *save.get(base_address + 0xfb0).ok_or_else(|| {
+            format!(
+                "save '{}': slot {slot_num} frame offset {:#x} out of bounds (save len {})",
+                args.save.display(),
+                base_address + 0xfb0,
+                save.len()
+            )
+        })? as i32;
         let frame = rom_ref.map(|r| {
             let (addr, idx) = frame_base_address(r, frame_number);
             FrameInfo {
@@ -381,16 +372,16 @@ fn run(args: Args) -> Result<(), String> {
 
         let gray = render_photo(rom_tuple, &save, base_address);
         let large = upscale_nearest(&gray, WIDTH, HEIGHT, SCALE);
-        let avif = mono::encode_gray_pair(&gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H)
-            .map_err(|e| {
+        let avif = mono::encode_gray_pair(&gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H).map_err(
+            |e| {
                 format!(
                     "couldn't encode slot {slot_num} ({}): {e}",
                     filenames[slot_num - 1]
                 )
-            })?;
+            },
+        )?;
         let filename = &filenames[slot_num - 1];
-        std::fs::write(filename, &avif)
-            .map_err(|e| format!("couldn't write '{filename}': {e}"))?;
+        std::fs::write(filename, &avif).map_err(|e| format!("couldn't write '{filename}': {e}"))?;
         Ok::<(), String>(())
     })?;
     Ok(())

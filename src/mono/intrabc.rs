@@ -53,8 +53,8 @@ const MV_CLASSN: [[u16; 2]; 10] = [
 /// `Default_Mv_Comp.Sign_Cdf` (shared by both components here).
 const MV_SIGN: [u16; 2] = [16384, 32768];
 
-/// `read_mv_residual` with mv_prec = -1 (force-integer path) never touches
-/// the fractional tables, so they are not transcribed.
+// `read_mv_residual` with mv_prec = -1 (force-integer path) never touches
+// the fractional tables, so they are not transcribed.
 
 // ---------------------------------------------------------------------------
 // Motion-vector component CDFs (one set per component: 0 = vertical).
@@ -419,14 +419,7 @@ impl IntrabcState {
     /// Code the residual `M - P` (both integer-pel, i.e. multiples of 8),
     /// mirroring `read_mv_residual`: joint symbol selecting nonzero
     /// components, then one integer-only component diff each.
-    pub fn encode_mvd(
-        &mut self,
-        sym: &mut SymbolEncoder,
-        my: i32,
-        mx: i32,
-        py: i32,
-        px: i32,
-    ) {
+    pub fn encode_mvd(&mut self, sym: &mut SymbolEncoder, my: i32, mx: i32, py: i32, px: i32) {
         let dy = my - py;
         let dx = mx - px;
         debug_assert!(dy % 8 == 0 && dx % 8 == 0);
@@ -462,6 +455,7 @@ impl IntrabcState {
     }
 
     /// Pixels of the candidate source rect equal the block's pixels.
+    #[allow(clippy::too_many_arguments)]
     fn matches(
         &self,
         px: &[u8],
@@ -496,6 +490,7 @@ impl IntrabcState {
     /// inequality, computed here for the single-tile, 64px-SB,
     /// monochrome case. Returns the MV in 1/8-pel units plus the predictor
     /// it was found from (so callers avoid a second `predictor` query).
+    #[allow(clippy::too_many_arguments)]
     pub fn find_match(
         &self,
         px: &[u8],
@@ -577,9 +572,22 @@ impl IntrabcState {
                     let my = py + rdy * 8;
                     let mx = px_ + rdx * 8;
                     if let Some(mv) = self.probe_candidate_at(
-                        px, img_w, img_h, sx, sy, wpx, hpx, sbx, sby,
-                        total_sb64_per_row, active_sb_row, active_sb64,
-                        active_sb64_col, cur_fp, my, mx,
+                        px,
+                        img_w,
+                        img_h,
+                        sx,
+                        sy,
+                        wpx,
+                        hpx,
+                        sbx,
+                        sby,
+                        total_sb64_per_row,
+                        active_sb_row,
+                        active_sb64,
+                        active_sb64_col,
+                        cur_fp,
+                        my,
+                        mx,
                     ) {
                         return Some((mv, pred));
                     }
@@ -590,9 +598,22 @@ impl IntrabcState {
                         let my = py + rdy * 8;
                         let mx = px_ + rdx * 8;
                         if let Some(mv) = self.probe_candidate_at(
-                            px, img_w, img_h, sx, sy, wpx, hpx, sbx, sby,
-                            total_sb64_per_row, active_sb_row, active_sb64,
-                            active_sb64_col, cur_fp, my, mx,
+                            px,
+                            img_w,
+                            img_h,
+                            sx,
+                            sy,
+                            wpx,
+                            hpx,
+                            sbx,
+                            sby,
+                            total_sb64_per_row,
+                            active_sb_row,
+                            active_sb64,
+                            active_sb64_col,
+                            cur_fp,
+                            my,
+                            mx,
                         ) {
                             return Some((mv, pred));
                         }
@@ -627,9 +648,22 @@ impl IntrabcState {
         px_: i32,
     ) -> Option<(i32, i32)> {
         self.probe_candidate_at(
-            px, img_w, img_h, sx, sy, wpx, hpx, sbx, sby,
-            total_sb64_per_row, active_sb_row, active_sb64,
-            active_sb64_col, cur_fp, py, px_,
+            px,
+            img_w,
+            img_h,
+            sx,
+            sy,
+            wpx,
+            hpx,
+            sbx,
+            sby,
+            total_sb64_per_row,
+            active_sb_row,
+            active_sb64,
+            active_sb64_col,
+            cur_fp,
+            py,
+            px_,
         )
     }
 
@@ -728,14 +762,7 @@ impl IntrabcState {
     /// `splat_intraref`, intrabc blocks their MV) and mark it decoded.
     /// Call sites follow decode order (the partition recursion), so the
     /// decoded bitmap always matches what the decoder has available.
-    pub fn record(
-        &mut self,
-        r: usize,
-        c: usize,
-        bw4: usize,
-        bh4: usize,
-        mv: Option<(i32, i32)>,
-    ) {
+    pub fn record(&mut self, r: usize, c: usize, bw4: usize, bh4: usize, mv: Option<(i32, i32)>) {
         for y in 0..bh4 {
             for x in 0..bw4 {
                 let i = (r + y) * self.cols + (c + x);

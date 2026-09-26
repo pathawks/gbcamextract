@@ -32,9 +32,9 @@
 //! Specification: OBU framing §5.3, sequence header §5.5, frame header §5.9,
 //! partitions §5.11.3, palette §5.11.46/.49/.50, CDF tables §9.3/§9.4.
 
-use gamut_bitstream::{BitWriter, SymbolEncoder, write_leb128};
+use gamut_bitstream::{write_leb128, BitWriter, SymbolEncoder};
 use gamut_isobmff::{
-    EntityGroup, IsoBmffImage, Item, Property, PropertyKind, write as write_isobmff,
+    write as write_isobmff, EntityGroup, IsoBmffImage, Item, Property, PropertyKind,
 };
 use std::io;
 
@@ -120,8 +120,7 @@ const SKIP: [[u16; 2]; 3] = [[31671, 32768], [16515, 32768], [4576, 32768]];
 
 /// `Default_Kf_Y_Mode_Cdf[0][0]` — the only row used (all neighbours are DC).
 const INTRA_Y_DC_ROW: [u16; 13] = [
-    15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165, 29093, 30466,
-    32768,
+    15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165, 29093, 30466, 32768,
 ];
 
 /// `Default_Palette_Y_Mode_Cdf`, rows for the block sizes we emit,
@@ -261,8 +260,7 @@ impl Cdfs {
             part_w16: PARTITION_W16.map(|row| AdaptCdf::new(&row)),
             skip: SKIP.map(|row| AdaptCdf::new(&row)),
             y_dc: AdaptCdf::new(&INTRA_Y_DC_ROW),
-            pal_mode: PALETTE_Y_MODE
-                .map(|rows| rows.map(|row| AdaptCdf::new(&row))),
+            pal_mode: PALETTE_Y_MODE.map(|rows| rows.map(|row| AdaptCdf::new(&row))),
             pal_size: PALETTE_Y_SIZE.map(|row| AdaptCdf::new(&row)),
             pal_idx2: PALETTE_SIZE_2_Y_COLOR.map(|row| AdaptCdf::new(&row)),
             pal_idx3: PALETTE_SIZE_3_Y_COLOR.map(|row| AdaptCdf::new(&row)),
@@ -481,20 +479,16 @@ impl<'a> TileEncoder<'a> {
     /// existing edge (split_or / forced-split) path, never `NONE`.
     /// `top_has_right` is the decoder edge flag for this node (SB roots
     /// start set, mirroring the generated tree root).
-    fn partition(
-        &mut self,
-        r: usize,
-        c: usize,
-        bw4: usize,
-        top_has_right: bool,
-    ) -> io::Result<()> {
+    fn partition(&mut self, r: usize, c: usize, bw4: usize, top_has_right: bool) -> io::Result<()> {
         if r >= self.mi_rows || c >= self.mi_cols {
             return Ok(());
         }
         let bsl = bw4.trailing_zeros() as usize;
         if bw4 == 4 {
             let ctx = self.partition_ctx(r, c, bsl);
-            self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
+            self.cdfs
+                .part(bsl, ctx)
+                .encode(&mut self.sym, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
             self.block(r, c, bsl, top_has_right, None)?;
             return Ok(());
@@ -509,8 +503,7 @@ impl<'a> TileEncoder<'a> {
         // to avoid repeating the same search and predictor query.
         if r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols {
             let levels = self.region_levels(r, c, bw4);
-            let carried: Option<((i32, i32), (i32, i32))> = if levels <= 1
-                || self.intrabc.is_none()
+            let carried: Option<((i32, i32), (i32, i32))> = if levels <= 1 || self.intrabc.is_none()
             {
                 None
             } else {
@@ -525,7 +518,9 @@ impl<'a> TileEncoder<'a> {
             };
             if take_none {
                 let ctx = self.partition_ctx(r, c, bsl);
-                self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
+                self.cdfs
+                    .part(bsl, ctx)
+                    .encode(&mut self.sym, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
                 self.block(r, c, bsl, top_has_right, carried)?;
                 return Ok(());
@@ -536,7 +531,9 @@ impl<'a> TileEncoder<'a> {
         let has_cols = c + half < self.mi_cols;
         if has_rows && has_cols {
             let ctx = self.partition_ctx(r, c, bsl);
-            self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_SPLIT);
+            self.cdfs
+                .part(bsl, ctx)
+                .encode(&mut self.sym, PARTITION_SPLIT);
         } else if has_cols {
             // Bottom edge: SPLIT-or-HORZ as a bool against the merged
             // split mass of the *current* row. No state update, exactly
@@ -547,30 +544,28 @@ impl<'a> TileEncoder<'a> {
             // psum == 0 would wrap the subtraction below; use the
             // exactly-dual [32767, 32768] instead (unreachable in
             // practice: mass(NONE) floors at 1, so psum <= 32767).
-            let c0 = if psum == 0 { 32767 } else { (32768 - psum) as u16 };
+            let c0 = if psum == 0 {
+                32767
+            } else {
+                (32768 - psum) as u16
+            };
             self.sym.encode_symbol(1, &[c0, 32768]);
         } else if has_rows {
             // Right edge: same arrangement with the vert masses.
             let ctx = self.partition_ctx(r, c, bsl);
             let psum = split_psum_vert(self.cdfs.part_row(bsl, ctx));
             debug_assert!(psum < 32768);
-            let c0 = if psum == 0 { 32767 } else { (32768 - psum) as u16 };
+            let c0 = if psum == 0 {
+                32767
+            } else {
+                (32768 - psum) as u16
+            };
             self.sym.encode_symbol(1, &[c0, 32768]);
         }
         // Forced SPLIT (neither flag) codes no symbol.
         self.partition(r, c, half, Self::child_top_right(0, top_has_right))?;
-        self.partition(
-            r,
-            c + half,
-            half,
-            Self::child_top_right(1, top_has_right),
-        )?;
-        self.partition(
-            r + half,
-            c,
-            half,
-            Self::child_top_right(2, top_has_right),
-        )?;
+        self.partition(r, c + half, half, Self::child_top_right(1, top_has_right))?;
+        self.partition(r + half, c, half, Self::child_top_right(2, top_has_right))?;
         self.partition(
             r + half,
             c + half,
@@ -906,9 +901,19 @@ impl<'a> TileEncoder<'a> {
                     self.sym.encode_literal(delta, palette_bits);
                     let prev = u32::from(new_slice[k]);
                     if prev + 1 >= 255 {
-                        // Decoder fills any remaining slots with 255 and
-                        // stops; only reachable for a trailing 255.
-                        debug_assert!(k + 1 == new_slice.len());
+                        // Decoder fills any remaining new slots with 255 and
+                        // stops (dav1d `read_pal_plane`:
+                        // `if (prev + !pl >= max)`). Reaching 255 must be
+                        // the last explicit new color; reaching 254 may
+                        // leave exactly one trailing 255, which the decoder
+                        // fills implicitly (e.g. new `[0, 254, 255]` stops
+                        // after 254).
+                        debug_assert!(
+                            k + 1 == new_slice.len()
+                                || (prev == 254
+                                    && k + 2 == new_slice.len()
+                                    && new_slice[k + 1] == 255)
+                        );
                         break;
                     }
                     // Matches dav1d's `1 + ulog2(max - prev - !pl)` with
@@ -926,8 +931,7 @@ impl<'a> TileEncoder<'a> {
                 let (rr, cc) = (r + y, c + x);
                 self.skip[rr * self.mi_cols + cc] = 1;
                 self.psize[rr * self.mi_cols + cc] = psize as u8;
-                self.pcolors[rr * self.mi_cols + cc][..psize]
-                    .copy_from_slice(colors_slice);
+                self.pcolors[rr * self.mi_cols + cc][..psize].copy_from_slice(colors_slice);
             }
         }
         // Mirror dav1d's `splat_intraref`: palette blocks contribute no
@@ -1076,7 +1080,7 @@ fn sequence_header_obu(w: u32, h: u32) -> Vec<u8> {
     bw.put_bit(0); // enable_superres
     bw.put_bit(0); // enable_cdef
     bw.put_bit(0); // enable_restoration
-    // color_config: 8-bit, monochrome, no description, full range.
+                   // color_config: 8-bit, monochrome, no description, full range.
     bw.put_bit(0); // high_bitdepth
     bw.put_bit(1); // mono_chrome
     bw.put_bit(0); // color_description_present_flag
@@ -1131,8 +1135,8 @@ fn tile_params(w: u32, h: u32) -> (u32, u32, u32, u32) {
     let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
     let max_log2_tile_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
     let max_log2_tile_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
-    let min_log2_tiles = min_log2_tile_cols
-        .max(tile_log2(max_tile_area_sb, sb_cols.saturating_mul(sb_rows)));
+    let min_log2_tiles =
+        min_log2_tile_cols.max(tile_log2(max_tile_area_sb, sb_cols.saturating_mul(sb_rows)));
     (
         min_log2_tile_cols,
         max_log2_tile_cols,
@@ -1227,8 +1231,8 @@ fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>>
     bw.put_bit(0); // disable_cdf_update (CDFs adapt)
     bw.put_bit(1); // allow_screen_content_tools (seq forces SELECT)
     bw.put_bit(0); // force_integer_mv (overridden to 1 for intra)
-    // frame_size_override implied 0 → dimensions from sequence max.
-    // render_and_frame_size_different = 0:
+                   // frame_size_override implied 0 → dimensions from sequence max.
+                   // render_and_frame_size_different = 0:
     bw.put_bit(0);
     // allow_intrabc:
     bw.put_bit(u8::from(allow_intrabc));
@@ -1268,14 +1272,14 @@ fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>>
     bw.put_bits(0, 8); // base_q_idx
     bw.put_bit(0); // DeltaQYDc.delta_coded
     bw.put_bit(0); // using_qmatrix
-    // segmentation_params: off:
+                   // segmentation_params: off:
     bw.put_bit(0); // segmentation_enabled
-    // (delta_q/lf: base_q_idx == 0 ⇒ nothing)
-    // (loop_filter/cdef/restoration: CodedLossless/AllLossless ⇒ nothing)
-    // (tx_mode: CodedLossless ⇒ ONLY_4X4, nothing)
-    // (frame_reference_mode/global_motion: intra ⇒ nothing)
+                   // (delta_q/lf: base_q_idx == 0 ⇒ nothing)
+                   // (loop_filter/cdef/restoration: CodedLossless/AllLossless ⇒ nothing)
+                   // (tx_mode: CodedLossless ⇒ ONLY_4X4, nothing)
+                   // (frame_reference_mode/global_motion: intra ⇒ nothing)
     bw.put_bit(1); // reduced_tx_set
-    // (film_grain: not present ⇒ nothing)
+                   // (film_grain: not present ⇒ nothing)
     bw.byte_align();
     Ok(bw.into_bytes())
 }
@@ -1488,6 +1492,21 @@ mod tests {
     }
 
     #[test]
+    fn three_color_254_255_implicit_fill() {
+        // Regression: `[0, 254, 255]` is accepted (3 colors) but the old
+        // `debug_assert!(k + 1 == new_slice.len())` fired when the delta
+        // chain reached 254 with an implicit trailing 255 remaining
+        // (the decoder fills it, so release decoded exactly).
+        let palette = [0u8, 254, 255];
+        let gray: Vec<u8> = (0..16 * 16).map(|i| palette[i % 3]).collect();
+        // Both palette paths (deterministic for the single block: no cache,
+        // no causal match) plus the full entry point.
+        encode_obu_payload_with(&gray, 16, 16, false).unwrap();
+        encode_obu_payload_with(&gray, 16, 16, true).unwrap();
+        encode_gray(&gray, 16, 16).unwrap();
+    }
+
+    #[test]
     fn invalid_inputs_return_invalid_input() {
         use std::io::ErrorKind;
         // Non-16-aligned dimensions.
@@ -1513,5 +1532,3 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
-
-
