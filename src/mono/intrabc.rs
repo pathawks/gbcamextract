@@ -82,24 +82,55 @@ impl MvComp {
 
     /// Cost-aware variant: accumulates `adapt_bits` for every adapting
     /// symbol (pre-update CDFs) into `cost`, then encodes identically.
-    fn encode_with_cost(&mut self, sym: &mut SymbolEncoder, d: i32, cost: &mut f64) {
+    fn encode_with_cost(
+        &mut self,
+        sym: &mut SymbolEncoder,
+        d: i32,
+        cost: &mut f64,
+        use_cost: bool,
+        emit: bool,
+    ) {
         debug_assert!(d != 0 && d % 8 == 0);
         let m = (d.abs() / 8 - 1) as u32;
-        *cost += adapt_bits(&self.sign.cdf, usize::from(d < 0));
-        self.sign.encode(sym, usize::from(d < 0));
+        if use_cost {
+            *cost += adapt_bits(&self.sign.cdf, usize::from(d < 0));
+        }
+        if emit {
+            self.sign.encode(sym, usize::from(d < 0));
+        } else {
+            self.sign.update(usize::from(d < 0));
+        }
         let cl = if m == 0 { 0 } else { m.ilog2() };
         debug_assert!(cl <= 10);
-        *cost += adapt_bits(&self.classes.cdf, cl as usize);
-        self.classes.encode(sym, cl as usize);
+        if use_cost {
+            *cost += adapt_bits(&self.classes.cdf, cl as usize);
+        }
+        if emit {
+            self.classes.encode(sym, cl as usize);
+        } else {
+            self.classes.update(cl as usize);
+        }
         if cl == 0 {
-            *cost += adapt_bits(&self.class0.cdf, m as usize);
-            self.class0.encode(sym, m as usize);
+            if use_cost {
+                *cost += adapt_bits(&self.class0.cdf, m as usize);
+            }
+            if emit {
+                self.class0.encode(sym, m as usize);
+            } else {
+                self.class0.update(m as usize);
+            }
         } else {
             let rem = m - (1 << cl);
             for n in 0..cl {
                 let s = ((rem >> n) & 1) as usize;
-                *cost += adapt_bits(&self.classn[n as usize].cdf, s);
-                self.classn[n as usize].encode(sym, s);
+                if use_cost {
+                    *cost += adapt_bits(&self.classn[n as usize].cdf, s);
+                }
+                if emit {
+                    self.classn[n as usize].encode(sym, s);
+                } else {
+                    self.classn[n as usize].update(s);
+                }
             }
         }
     }
@@ -111,7 +142,7 @@ impl MvComp {
 // immediate above/left rows).
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct MvRec {
     intrabc: bool,
     my: i32,
@@ -182,10 +213,15 @@ enum CachedDecision {
 
 /// Global stats for reporting fallback frequency (per-process, atomic for
 /// Rayon parallelism; reset per benchmark via `reset_pattern_stats`).
+/// Committed (non-speculative) searches are counted in `PATTERN_QUERIES` /
+/// `PATTERN_FALLBACKS`; speculative trial searches in `*_SPEC`. Totals are
+/// the sum; rejected trials must not increment the committed counters.
 static PATTERN_QUERIES: AtomicU64 = AtomicU64::new(0);
 static PATTERN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static PATTERN_QUERIES_SPEC: AtomicU64 = AtomicU64::new(0);
+static PATTERN_FALLBACKS_SPEC: AtomicU64 = AtomicU64::new(0);
 
-/// Number of 16x16 cached-path attempts (verified 8x image only).
+/// Committed 16x16 cached-path attempts (verified 8x image only).
 // Diagnostics for tests/benchmarks; unused by the extraction binary itself,
 // so `dead_code` would otherwise fire on the non-test build.
 #[allow(dead_code)]
@@ -202,6 +238,28 @@ pub fn pattern_stats() -> (u64, u64) {
 pub fn reset_pattern_stats() {
     PATTERN_QUERIES.store(0, Ordering::Relaxed);
     PATTERN_FALLBACKS.store(0, Ordering::Relaxed);
+    PATTERN_QUERIES_SPEC.store(0, Ordering::Relaxed);
+    PATTERN_FALLBACKS_SPEC.store(0, Ordering::Relaxed);
+}
+
+/// Speculative 16x16 cached-path attempts (rejected-trial work, not committed).
+// See `pattern_stats` for the `dead_code` rationale.
+#[allow(dead_code)]
+pub fn pattern_stats_speculative() -> (u64, u64) {
+    (
+        PATTERN_QUERIES_SPEC.load(Ordering::Relaxed),
+        PATTERN_FALLBACKS_SPEC.load(Ordering::Relaxed),
+    )
+}
+
+/// Total 16x16 cached-path attempts (committed + speculative).
+// See `pattern_stats` for the `dead_code` rationale.
+#[allow(dead_code)]
+pub fn pattern_stats_total() -> (u64, u64) {
+    (
+        PATTERN_QUERIES.load(Ordering::Relaxed) + PATTERN_QUERIES_SPEC.load(Ordering::Relaxed),
+        PATTERN_FALLBACKS.load(Ordering::Relaxed) + PATTERN_FALLBACKS_SPEC.load(Ordering::Relaxed),
+    )
 }
 
 fn level_to_idx(v: u8) -> Option<u8> {
@@ -272,9 +330,14 @@ pub struct PatternCache {
     positions: Vec<u32>,
     // Per-image diagnostics (Cell for `&self` queries; Rayon-safe because
     // each image owns its state on one thread). Globals below aggregate
-    // across images for benchmarks.
+    // across images for benchmarks. `queries`/`fallbacks` count committed
+    // (non-speculative) searches; `spec_*` count speculative trial work so
+    // rejected branches never pollute the committed counters while total
+    // work stays observable (`total = committed + speculative`).
     queries: Cell<u64>,
     fallbacks: Cell<u64>,
+    spec_queries: Cell<u64>,
+    spec_fallbacks: Cell<u64>,
 }
 
 impl PatternCache {
@@ -287,6 +350,8 @@ impl PatternCache {
             positions: Vec::new(),
             queries: Cell::new(0),
             fallbacks: Cell::new(0),
+            spec_queries: Cell::new(0),
+            spec_fallbacks: Cell::new(0),
         }
     }
 
@@ -315,11 +380,11 @@ pub struct IntrabcState {
     pub(super) rec: Vec<MvRec>,
     pub(super) decoded: Vec<bool>,
     pattern: PatternCache,
-    /// When true, cached-search diagnostics (per-image Cells and process
-    /// globals) are suppressed. RDO trials set this so rejected candidates
-    /// leave no search-cache state changes; the winning re-encode runs with
-    /// false so committed searches are counted exactly once.
-    speculative: bool,
+    /// Nesting-aware speculative depth (see `is_speculative`): trials push
+    /// depth so rejected candidates increment speculative (not committed)
+    /// diagnostics; the winning re-encode runs at the enclosing depth so
+    /// committed searches are counted exactly once.
+    speculative: u32,
 }
 
 impl IntrabcState {
@@ -340,7 +405,7 @@ impl IntrabcState {
             rec: vec![blank; cols * rows],
             decoded: vec![false; cols * rows],
             pattern: PatternCache::empty(),
-            speculative: false,
+            speculative: 0,
         }
     }
 
@@ -429,6 +494,8 @@ impl IntrabcState {
             positions,
             queries: Cell::new(0),
             fallbacks: Cell::new(0),
+            spec_queries: Cell::new(0),
+            spec_fallbacks: Cell::new(0),
         };
     }
 
@@ -440,19 +507,47 @@ impl IntrabcState {
         self.pattern.memory_bytes()
     }
 
-    /// Per-image cached-path attempts (test-isolated; see globals for
-    /// cross-image benchmarks).
+    /// Per-image committed cached-path attempts (test-isolated; see globals
+    /// for cross-image benchmarks).
     // See `pattern_stats` for the `dead_code` rationale.
     #[allow(dead_code)]
     pub fn pattern_queries(&self) -> u64 {
         self.pattern.queries.get()
     }
 
-    /// Per-image stripe fallbacks.
+    /// Per-image committed stripe fallbacks.
     // See `pattern_stats` for the `dead_code` rationale.
     #[allow(dead_code)]
     pub fn pattern_fallbacks(&self) -> u64 {
         self.pattern.fallbacks.get()
+    }
+
+    /// Per-image speculative cached-path attempts (rejected-trial work).
+    // See `pattern_stats` for the `dead_code` rationale.
+    #[allow(dead_code)]
+    pub fn pattern_spec_queries(&self) -> u64 {
+        self.pattern.spec_queries.get()
+    }
+
+    /// Per-image speculative stripe fallbacks.
+    // See `pattern_stats` for the `dead_code` rationale.
+    #[allow(dead_code)]
+    pub fn pattern_spec_fallbacks(&self) -> u64 {
+        self.pattern.spec_fallbacks.get()
+    }
+
+    /// Per-image total cached-path attempts (committed + speculative).
+    // See `pattern_stats` for the `dead_code` rationale.
+    #[allow(dead_code)]
+    pub fn pattern_total_queries(&self) -> u64 {
+        self.pattern.queries.get() + self.pattern.spec_queries.get()
+    }
+
+    /// Per-image total stripe fallbacks (committed + speculative).
+    // See `pattern_stats` for the `dead_code` rationale.
+    #[allow(dead_code)]
+    pub fn pattern_total_fallbacks(&self) -> u64 {
+        self.pattern.fallbacks.get() + self.pattern.spec_fallbacks.get()
     }
 
     /// Whether the 8x invariant held for this image.
@@ -463,20 +558,51 @@ impl IntrabcState {
     }
 
     /// Cost-aware flag: `adapt_bits` from the pre-update row, then encode.
-    pub fn flag_with_cost(&mut self, sym: &mut SymbolEncoder, use_bc: bool, cost: &mut f64) {
+    pub fn flag_with_cost(
+        &mut self,
+        sym: &mut SymbolEncoder,
+        use_bc: bool,
+        cost: &mut f64,
+        use_cost: bool,
+        emit: bool,
+    ) {
         let s = usize::from(use_bc);
-        *cost += adapt_bits(&self.flag.cdf, s);
-        self.flag.encode(sym, s);
+        if use_cost {
+            *cost += adapt_bits(&self.flag.cdf, s);
+        }
+        if emit {
+            self.flag.encode(sym, s);
+        } else {
+            self.flag.update(s);
+        }
     }
 
-    /// Whether speculative trials suppress cached-search diagnostics.
-    pub(super) fn set_speculative(&mut self, v: bool) {
-        self.speculative = v;
+    /// Nesting-aware speculative depth: 0 is committed, >0 is inside one or
+    /// more RDO trials. Trial searches increment speculative counters;
+    /// committed searches increment committed counters. Rejected branches
+    /// therefore never pollute committed-path diagnostics while total work
+    /// stays observable. Depth (not a bool) preserves the enclosing state
+    /// when trials nest: inner winners remain speculative relative to an
+    /// outer trial.
+    pub(super) fn is_speculative(&self) -> bool {
+        self.speculative_depth() > 0
     }
 
-    /// Snapshot the small adapting CDFs plus the speculative flag (not the
+    pub(super) fn speculative_depth(&self) -> u32 {
+        self.speculative
+    }
+
+    pub(super) fn enter_speculative(&mut self) {
+        self.speculative = self.speculative.saturating_add(1);
+    }
+
+    pub(super) fn restore_speculative(&mut self, saved: u32) {
+        self.speculative = saved;
+    }
+
+    /// Snapshot the small adapting CDFs plus the speculative depth (not the
     /// large `rec`/`decoded`/pattern tables, which callers save by footprint).
-    pub(super) fn snapshot_cdfs(&self) -> (AdaptCdf, AdaptCdf, [MvComp; 2], bool) {
+    pub(super) fn snapshot_cdfs(&self) -> (AdaptCdf, AdaptCdf, [MvComp; 2], u32) {
         (
             self.flag.clone(),
             self.joint.clone(),
@@ -485,7 +611,7 @@ impl IntrabcState {
         )
     }
 
-    pub(super) fn restore_cdfs(&mut self, saved: (AdaptCdf, AdaptCdf, [MvComp; 2], bool)) {
+    pub(super) fn restore_cdfs(&mut self, saved: (AdaptCdf, AdaptCdf, [MvComp; 2], u32)) {
         self.flag = saved.0;
         self.joint = saved.1;
         self.comp = saved.2;
@@ -750,12 +876,12 @@ impl IntrabcState {
     pub fn encode_mvd_with_cost(
         &mut self,
         sym: &mut SymbolEncoder,
-        my: i32,
-        mx: i32,
-        py: i32,
-        px: i32,
+        mv: ((i32, i32), (i32, i32)),
         cost: &mut f64,
+        use_cost: bool,
+        emit: bool,
     ) {
+        let ((my, mx), (py, px)) = mv;
         let dy = my - py;
         let dx = mx - px;
         debug_assert!(dy % 8 == 0 && dx % 8 == 0);
@@ -765,13 +891,19 @@ impl IntrabcState {
             (true, false) => 2,
             (false, false) => 3,
         };
-        *cost += adapt_bits(&self.joint.cdf, joint);
-        self.joint.encode(sym, joint);
+        if use_cost {
+            *cost += adapt_bits(&self.joint.cdf, joint);
+        }
+        if emit {
+            self.joint.encode(sym, joint);
+        } else {
+            self.joint.update(joint);
+        }
         if dy != 0 {
-            self.comp[0].encode_with_cost(sym, dy, cost);
+            self.comp[0].encode_with_cost(sym, dy, cost, use_cost, emit);
         }
         if dx != 0 {
-            self.comp[1].encode_with_cost(sym, dx, cost);
+            self.comp[1].encode_with_cost(sym, dx, cost, use_cost, emit);
         }
     }
 
@@ -1147,15 +1279,32 @@ impl IntrabcState {
         c: usize,
         top_has_right: bool,
     ) -> CachedDecision {
-        // Speculative RDO trials must leave no search-cache state changes
-        // (rejected candidates restore everything). Suppress both the
-        // process-global atomics and the per-image Cells; the winning
-        // re-encode runs non-speculatively and counts exactly once.
-        let spec = self.speculative;
-        if !spec {
+        // Nesting-aware diagnostics: speculative (trial) searches increment
+        // speculative counters only; committed searches increment committed
+        // counters only. Rejected branches therefore never pollute the
+        // committed path, while total work stays observable. The winning
+        // re-encode runs at the enclosing depth and counts exactly once.
+        let spec = self.is_speculative();
+        if spec {
+            PATTERN_QUERIES_SPEC.fetch_add(1, Ordering::Relaxed);
+            self.pattern
+                .spec_queries
+                .set(self.pattern.spec_queries.get() + 1);
+        } else {
             PATTERN_QUERIES.fetch_add(1, Ordering::Relaxed);
             self.pattern.queries.set(self.pattern.queries.get() + 1);
         }
+        let count_fallback = || {
+            if spec {
+                PATTERN_FALLBACKS_SPEC.fetch_add(1, Ordering::Relaxed);
+                self.pattern
+                    .spec_fallbacks
+                    .set(self.pattern.spec_fallbacks.get() + 1);
+            } else {
+                PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
+            }
+        };
         let sx = c as i32 * 4;
         let sy = r as i32 * 4;
         let (sbx, sby) = ((c as i32 / 16) * 64, (r as i32 / 16) * 64);
@@ -1174,20 +1323,14 @@ impl IntrabcState {
             level_to_idx(px[(syu + 8) * img_w + sxu]),
             level_to_idx(px[(syu + 8) * img_w + sxu + 8]),
         ) else {
-            if !spec {
-                PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
-            }
+            count_fallback();
             return CachedDecision::Fallback;
         };
         // 4px-offset sources can only match stripe queries (see module docs).
         // Fall back narrowly there; uniform defensively falls back too
         // (uniform blocks never reach here via partition/block gating).
         if (a == b && c0 == d) || (a == c0 && b == d) {
-            if !spec {
-                PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
-            }
+            count_fallback();
             return CachedDecision::Fallback;
         }
         let key = pack_key(a, b, c0, d);

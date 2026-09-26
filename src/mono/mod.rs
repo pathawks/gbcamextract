@@ -37,19 +37,36 @@ use gamut_isobmff::{
     write as write_isobmff, EntityGroup, IsoBmffImage, Item, Property, PropertyKind,
 };
 use std::io;
+use std::ops::{Deref, DerefMut};
 
 mod intrabc;
 use intrabc::{IntrabcState, MvComp, MvRec};
 
 /// Cached-search diagnostics for the 16x16 8x path: `(queries, fallbacks)`.
-/// `queries` counts verified-image 16x16 attempts; `fallbacks` counts the
-/// narrow stripe fallbacks to the ring oracle. Both are process-global
-/// atomics (Rayon-safe); reset per measurement.
+/// Committed (non-speculative) searches: `queries` counts verified-image
+/// 16x16 attempts; `fallbacks` counts the narrow stripe fallbacks to the
+/// ring oracle. Both are process-global atomics (Rayon-safe); reset per
+/// measurement. See `pattern_cache_stats_speculative` / `_total` for
+/// rejected-trial work vs combined totals.
 // Diagnostics for tests/benchmarks; unused by the extraction binary itself,
 // so `dead_code` would otherwise fire on the non-test build.
 #[allow(dead_code)]
 pub fn pattern_cache_stats() -> (u64, u64) {
     intrabc::pattern_stats()
+}
+
+/// Speculative trial searches (rejected branches; not committed).
+// See `pattern_cache_stats` for the `dead_code` rationale.
+#[allow(dead_code)]
+pub fn pattern_cache_stats_speculative() -> (u64, u64) {
+    intrabc::pattern_stats_speculative()
+}
+
+/// Total searches (committed + speculative).
+// See `pattern_cache_stats` for the `dead_code` rationale.
+#[allow(dead_code)]
+pub fn pattern_cache_stats_total() -> (u64, u64) {
+    intrabc::pattern_stats_total()
 }
 
 /// Reset cached-search diagnostics.
@@ -66,19 +83,23 @@ pub fn reset_pattern_cache_stats() {
 /// smaller payload is kept; when `false`, only the palette path is encoded
 /// (faster, byte-identical to the pre-IntraBC encoder: no flag symbols, no
 /// header bit).
-const USE_INTRABC: bool = true;
+pub const USE_INTRABC: bool = true;
 
 /// Whole-image RDO-vs-baseline fallback diagnostics (process-global,
 /// Rayon-safe; reset per measurement). `RDO_WINS` counts complete AVIF
 /// files where the cost-based strategy was smaller; `BASELINE_WINS` counts
-/// ties plus baseline-smaller files (baseline preferred on ties).
+/// ordinary ties plus baseline-smaller files (baseline preferred on ties).
+/// Unexpected RDO encode failures (baseline succeeded but RDO errored) are
+/// counted separately in `RDO_ERRORS` so fallback does not conceal errors.
 /// `RDO_CANDIDATES` counts trial candidate encodes evaluated (legal
 /// palette/copy/split trials, including nested children).
 static RDO_WINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BASELINE_WINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RDO_CANDIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RDO_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// RDO file-level wins/losses plus total trial candidates (see statics).
+/// `BASELINE_WINS` excludes unexpected RDO failures; see `rdo_errors`.
 // Diagnostics for tests/benchmarks; unused by the extraction binary itself,
 // so `dead_code` would otherwise fire on the non-test build.
 #[allow(dead_code)]
@@ -91,6 +112,14 @@ pub fn rdo_stats() -> (u64, u64, u64) {
     )
 }
 
+/// Unexpected RDO encode failures (baseline succeeded, RDO errored).
+// See `rdo_stats` for the `dead_code` rationale.
+#[allow(dead_code)]
+pub fn rdo_errors() -> u64 {
+    use std::sync::atomic::Ordering;
+    RDO_ERRORS.load(Ordering::Relaxed)
+}
+
 /// Reset RDO fallback diagnostics (benchmarks/tests).
 // See `rdo_stats` for the `dead_code` rationale.
 #[allow(dead_code)]
@@ -99,6 +128,7 @@ pub fn reset_rdo_stats() {
     RDO_WINS.store(0, Ordering::Relaxed);
     BASELINE_WINS.store(0, Ordering::Relaxed);
     RDO_CANDIDATES.store(0, Ordering::Relaxed);
+    RDO_ERRORS.store(0, Ordering::Relaxed);
 }
 
 /// Motion-vector pair and predictor in 1/8-pel units (matches
@@ -107,6 +137,45 @@ type MvPair = (i32, i32);
 type BcMatch = (MvPair, MvPair);
 /// Estimated cost plus the copy MV/predictor it was measured with.
 type CopyCost = (f64, BcMatch);
+
+/// A 64x64 superblock's contained partition tree has at most 21 nodes
+/// (64, four 32s, sixteen 16s). Plans are stack-bounded and live only for
+/// the candidate and incoming probability/neighbor/availability state that
+/// produced them.
+const MAX_PLAN_NODES: usize = 21;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlanDecision {
+    Palette,
+    Copy(BcMatch),
+    Split,
+}
+
+struct PartitionPlan {
+    nodes: [Option<PlanDecision>; MAX_PLAN_NODES],
+    len: usize,
+}
+
+impl PartitionPlan {
+    fn new() -> Self {
+        Self {
+            nodes: [None; MAX_PLAN_NODES],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, decision: PlanDecision) {
+        assert!(self.len < MAX_PLAN_NODES, "partition plan exceeds one SB");
+        self.nodes[self.len] = Some(decision);
+        self.len += 1;
+    }
+
+    fn extend(&mut self, other: &Self) {
+        for decision in other.nodes[..other.len].iter().flatten().copied() {
+            self.push(decision);
+        }
+    }
+}
 
 /// `InvalidInput` helper for supported-input violations at the boundary.
 fn invalid_input(msg: String) -> io::Error {
@@ -545,22 +614,66 @@ pub(crate) fn adapt_bits(cdf: &[u16], sym: usize) -> f64 {
 
 /// One adapting CDF: owned copy of a default row plus the spec §8.2.6
 /// adaptation counter (both start fresh for every image).
+/// Fixed-capacity row so speculative snapshots copy CDF state inline rather
+/// than cloning one heap allocation per adapting context.
+#[derive(Clone, Debug, PartialEq)]
+struct FixedCdfRow {
+    values: [u16; 13],
+    len: usize,
+}
+
+impl Deref for FixedCdfRow {
+    type Target = [u16];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values[..self.len]
+    }
+}
+
+impl DerefMut for FixedCdfRow {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values[..self.len]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AdaptCdf {
-    cdf: Vec<u16>,
+    cdf: FixedCdfRow,
     count: u16,
 }
 
 impl AdaptCdf {
     fn new(row: &[u16]) -> Self {
+        assert!(row.len() <= 13, "encoder CDF row exceeds fixed capacity");
+        let mut values = [0; 13];
+        values[..row.len()].copy_from_slice(row);
         Self {
-            cdf: row.to_vec(),
+            cdf: FixedCdfRow {
+                values,
+                len: row.len(),
+            },
             count: 0,
         }
     }
 
     fn encode(&mut self, sym: &mut SymbolEncoder, s: usize) {
         sym.encode_symbol_adapt(s, &mut self.cdf, &mut self.count);
+    }
+
+    fn update(&mut self, symbol: usize) {
+        let n = self.cdf.len();
+        let rate = 3
+            + u32::from(self.count > 15)
+            + u32::from(self.count > 31)
+            + (31 - (n as u32).leading_zeros()).min(2);
+        let (_, body) = self.cdf.split_last_mut().expect("CDF row is non-empty");
+        for value in &mut body[..symbol] {
+            *value -= *value >> rate;
+        }
+        for value in &mut body[symbol..] {
+            *value += ((1u16 << 15) - *value) >> rate;
+        }
+        self.count = (self.count + 1).min(32);
     }
 }
 
@@ -711,6 +824,9 @@ struct TileEncoder<'a> {
     /// selection among legal palette/copy/split alternatives. When false,
     /// the unchanged greedy baseline runs byte-identically.
     use_rdo: bool,
+    /// RDO trials need adapted CDFs and fractional costs, but not arithmetic
+    /// output. Keeping trials cost-only avoids cloning the growing coder.
+    cost_only: bool,
 }
 
 /// `Partition_Context` update table (§5.11.4), rows [above|left],
@@ -722,21 +838,25 @@ const AL_PART_NONE_LEFT: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 /// Scoped snapshot for one RDO trial rect (see RDO docs in `impl`).
 /// `candidates` is deliberately excluded (persists across rejects).
 struct Snapshot {
-    sym: SymbolEncoder,
+    sym: Option<SymbolEncoder>,
     cdfs: Cdfs,
-    intrabc_cdfs: Option<(AdaptCdf, AdaptCdf, [MvComp; 2], bool)>,
+    intrabc_cdfs: Option<(AdaptCdf, AdaptCdf, [MvComp; 2], u32)>,
     cost: f64,
+    cost_only: bool,
     r: usize,
     c: usize,
     bw4: usize,
     bh4: usize,
-    skip_fp: Vec<u8>,
-    psize_fp: Vec<u8>,
-    pcolors_fp: Vec<[u8; 8]>,
-    decoded_fp: Vec<bool>,
-    rec_fp: Vec<MvRec>,
-    above_fp: Vec<u8>,
-    left_fp: Vec<u8>,
+    footprint_len: usize,
+    skip_fp: [u8; 256],
+    psize_fp: [u8; 256],
+    pcolors_fp: [[u8; 8]; 256],
+    decoded_fp: [bool; 256],
+    rec_fp: [MvRec; 256],
+    above_len: usize,
+    above_fp: [u8; 16],
+    left_len: usize,
+    left_fp: [u8; 16],
 }
 
 impl<'a> TileEncoder<'a> {
@@ -797,6 +917,7 @@ impl<'a> TileEncoder<'a> {
             cost: 0.0,
             candidates: 0,
             use_rdo,
+            cost_only: false,
         })
     }
 
@@ -882,57 +1003,106 @@ impl<'a> TileEncoder<'a> {
     // Each computes `adapt_bits` (or literal bits) from the pre-update row,
     // accumulates into `self.cost`, then encodes identically. Baseline and
     // RDO share them so committed bytes are identical for identical decisions.
+    // When `use_rdo` is false (baseline fallback) costs are never used for
+    // decisions, so the fractional estimates (including `log2`) are skipped
+    // entirely for speed; bytes and adaptive updates are unchanged.
     fn enc_part(&mut self, bsl: usize, ctx: usize, s: usize) {
-        let bits = adapt_bits(self.cdfs.part_row(bsl, ctx), s);
-        self.cost += bits;
-        self.cdfs.part(bsl, ctx).encode(&mut self.sym, s);
+        if self.use_rdo {
+            let bits = adapt_bits(self.cdfs.part_row(bsl, ctx), s);
+            self.cost += bits;
+        }
+        let cost_only = self.cost_only;
+        let row = self.cdfs.part(bsl, ctx);
+        if cost_only {
+            row.update(s);
+        } else {
+            row.encode(&mut self.sym, s);
+        }
     }
 
     fn enc_skip(&mut self, ctx: usize, s: usize) {
-        let bits = adapt_bits(&self.cdfs.skip[ctx].cdf, s);
-        self.cost += bits;
-        self.cdfs.skip[ctx].encode(&mut self.sym, s);
+        if self.use_rdo {
+            let bits = adapt_bits(&self.cdfs.skip[ctx].cdf, s);
+            self.cost += bits;
+        }
+        if self.cost_only {
+            self.cdfs.skip[ctx].update(s);
+        } else {
+            self.cdfs.skip[ctx].encode(&mut self.sym, s);
+        }
     }
 
     fn enc_y_dc(&mut self, s: usize) {
-        let bits = adapt_bits(&self.cdfs.y_dc.cdf, s);
-        self.cost += bits;
-        self.cdfs.y_dc.encode(&mut self.sym, s);
+        if self.use_rdo {
+            let bits = adapt_bits(&self.cdfs.y_dc.cdf, s);
+            self.cost += bits;
+        }
+        if self.cost_only {
+            self.cdfs.y_dc.update(s);
+        } else {
+            self.cdfs.y_dc.encode(&mut self.sym, s);
+        }
     }
 
     fn enc_pal_mode(&mut self, bsl: usize, pctx: usize, s: usize) {
-        let bits = adapt_bits(&self.cdfs.pal_mode[bsl - 2][pctx].cdf, s);
-        self.cost += bits;
-        self.cdfs.pal_mode[bsl - 2][pctx].encode(&mut self.sym, s);
+        if self.use_rdo {
+            let bits = adapt_bits(&self.cdfs.pal_mode[bsl - 2][pctx].cdf, s);
+            self.cost += bits;
+        }
+        if self.cost_only {
+            self.cdfs.pal_mode[bsl - 2][pctx].update(s);
+        } else {
+            self.cdfs.pal_mode[bsl - 2][pctx].encode(&mut self.sym, s);
+        }
     }
 
     fn enc_pal_size(&mut self, bsl: usize, s: usize) {
-        let bits = adapt_bits(&self.cdfs.pal_size[bsl - 2].cdf, s);
-        self.cost += bits;
-        self.cdfs.pal_size[bsl - 2].encode(&mut self.sym, s);
+        if self.use_rdo {
+            let bits = adapt_bits(&self.cdfs.pal_size[bsl - 2].cdf, s);
+            self.cost += bits;
+        }
+        if self.cost_only {
+            self.cdfs.pal_size[bsl - 2].update(s);
+        } else {
+            self.cdfs.pal_size[bsl - 2].encode(&mut self.sym, s);
+        }
     }
 
     fn enc_pal_idx(&mut self, n: usize, ctx: usize, s: usize) {
-        let row: &[u16] = match n {
-            2 => &self.cdfs.pal_idx2[ctx].cdf,
-            3 => &self.cdfs.pal_idx3[ctx].cdf,
-            _ => &self.cdfs.pal_idx4[ctx].cdf,
-        };
-        let bits = adapt_bits(row, s);
-        self.cost += bits;
-        self.cdfs.pal_idx(n, ctx).encode(&mut self.sym, s);
+        if self.use_rdo {
+            let row: &[u16] = match n {
+                2 => &self.cdfs.pal_idx2[ctx].cdf,
+                3 => &self.cdfs.pal_idx3[ctx].cdf,
+                _ => &self.cdfs.pal_idx4[ctx].cdf,
+            };
+            let bits = adapt_bits(row, s);
+            self.cost += bits;
+        }
+        if self.cost_only {
+            self.cdfs.pal_idx(n, ctx).update(s);
+        } else {
+            self.cdfs.pal_idx(n, ctx).encode(&mut self.sym, s);
+        }
     }
 
     fn enc_static(&mut self, s: usize, cdf: &[u16]) {
-        let bits = adapt_bits(cdf, s);
-        self.cost += bits;
-        self.sym.encode_symbol(s, cdf);
+        if self.use_rdo {
+            let bits = adapt_bits(cdf, s);
+            self.cost += bits;
+        }
+        if !self.cost_only {
+            self.sym.encode_symbol(s, cdf);
+        }
     }
 
     fn enc_lit(&mut self, val: u32, n: u32) {
         // Equiprobable `L()` bits (`read_literal` via fixed 1/2 CDF).
-        self.cost += f64::from(n);
-        self.sym.encode_literal(val, n);
+        if self.use_rdo {
+            self.cost += f64::from(n);
+        }
+        if !self.cost_only {
+            self.sym.encode_literal(val, n);
+        }
     }
 
     /// Record a terminal NONE partition over the `n4`-MI block.
@@ -1332,8 +1502,10 @@ impl<'a> TileEncoder<'a> {
         // (colors/cache/index construction delayed until the palette
         // branch actually needs it — copy blocks skip all of it.)
         if let Some(bc) = self.intrabc.as_mut() {
+            let emit = !self.cost_only;
+            let use_cost = self.use_rdo;
             let (sym, cost) = (&mut self.sym, &mut self.cost);
-            bc.flag_with_cost(sym, false, cost);
+            bc.flag_with_cost(sym, false, cost, use_cost, emit);
         }
 
         let colors_slice = &colors[..psize];
@@ -1584,8 +1756,10 @@ impl<'a> TileEncoder<'a> {
                 "internal: IntraBC match without IntraBC state",
             ));
         };
-        bc2.flag_with_cost(sym, true, cost);
-        bc2.encode_mvd_with_cost(sym, my, mx, py, px_, cost);
+        let emit = !self.cost_only;
+        let use_cost = self.use_rdo;
+        bc2.flag_with_cost(sym, true, cost, use_cost, emit);
+        bc2.encode_mvd_with_cost(sym, ((my, mx), (py, px_)), cost, use_cost, emit);
         let n4 = 1usize << bsl;
         for y in 0..n4 {
             for x in 0..n4 {
@@ -1626,23 +1800,31 @@ impl<'a> TileEncoder<'a> {
     // range/carry/flush ignored, future costs unmodeled — local, not global,
     // optimum).
     //
-    // State handling: each trial saves a scoped snapshot (sym clone, full
-    // small CDF clones, cost, intrabc CDFs+speculative flag, plus footprint
-    // slices for `skip`/`psize`/`pcolors`/`rec`/`decoded`/`above`/`left`
-    // covering the node's MI rect), sets speculative (suppressing pattern
-    // diagnostics), encodes the candidate, records `cost - base`, restores
-    // the snapshot (rejected state discarded, live untouched, speculative
-    // trials cannot make pixels available), and counts the trial in
-    // `self.candidates` (excluded from snapshots so it persists). The winner
-    // is re-encoded from the restored base non-speculatively (deterministic
-    // search ⇒ same MV/predictor), so committed stats count exactly once.
-    // No subtree cost is cached across contexts; every evaluation starts
-    // from the same incoming state.
+    // State handling: trials update costs and adapting CDFs without emitting
+    // arithmetic output. CDFs and bounded neighbour footprints are copied
+    // inline; the coder is untouched, and no snapshot vectors are allocated.
+    // Rejected trials restore that state and preserve candidate/search work
+    // counters separately. A winning split retains its decisions in a local
+    // plan and replays them only from the same incoming CDF, neighbor, and
+    // availability state. Plans never cross those state boundaries.
     // -----------------------------------------------------------------------
 
-    fn set_speculative(&mut self, v: bool) {
+    fn speculative_depth(&self) -> u32 {
+        self.intrabc
+            .as_ref()
+            .map(|bc| bc.speculative_depth())
+            .unwrap_or(0)
+    }
+
+    fn enter_speculative(&mut self) {
         if let Some(bc) = self.intrabc.as_mut() {
-            bc.set_speculative(v);
+            bc.enter_speculative();
+        }
+    }
+
+    fn restore_speculative(&mut self, saved: u32) {
+        if let Some(bc) = self.intrabc.as_mut() {
+            bc.restore_speculative(saved);
         }
     }
 
@@ -1654,12 +1836,32 @@ impl<'a> TileEncoder<'a> {
         (1..=4).contains(&levels)
     }
 
+    #[cfg(test)]
     fn save_snapshot(&self, r: usize, c: usize, bw4: usize, bh4: usize) -> Snapshot {
-        let mut skip_fp = Vec::with_capacity(bw4 * bh4);
-        let mut psize_fp = Vec::with_capacity(bw4 * bh4);
-        let mut pcolors_fp = Vec::with_capacity(bw4 * bh4);
-        let mut decoded_fp = Vec::new();
-        let mut rec_fp = Vec::new();
+        self.save_snapshot_inner(r, c, bw4, bh4, true)
+    }
+
+    fn save_trial_snapshot(&self, r: usize, c: usize, bw4: usize, bh4: usize) -> Snapshot {
+        self.save_snapshot_inner(r, c, bw4, bh4, false)
+    }
+
+    fn save_snapshot_inner(
+        &self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        bh4: usize,
+        save_symbol_state: bool,
+    ) -> Snapshot {
+        const MAX_FOOTPRINT: usize = 16 * 16;
+        debug_assert!(bw4 * bh4 <= MAX_FOOTPRINT);
+        debug_assert!(bw4 <= 16 && bh4 <= 16);
+        let mut skip_fp = [0; MAX_FOOTPRINT];
+        let mut psize_fp = [0; MAX_FOOTPRINT];
+        let mut pcolors_fp = [[0; 8]; MAX_FOOTPRINT];
+        let mut decoded_fp = [false; MAX_FOOTPRINT];
+        let mut rec_fp = [MvRec::default(); MAX_FOOTPRINT];
+        let mut footprint_len = 0;
         for y in 0..bh4 {
             for x in 0..bw4 {
                 let (rr, cc) = (r + y, c + x);
@@ -1668,52 +1870,64 @@ impl<'a> TileEncoder<'a> {
                 // Defensive bounds keep release safe.
                 if rr < self.mi_rows && cc < self.mi_cols {
                     let idx = rr * self.mi_cols + cc;
-                    skip_fp.push(self.skip[idx]);
-                    psize_fp.push(self.psize[idx]);
-                    pcolors_fp.push(self.pcolors[idx]);
+                    skip_fp[footprint_len] = self.skip[idx];
+                    psize_fp[footprint_len] = self.psize[idx];
+                    pcolors_fp[footprint_len] = self.pcolors[idx];
                     if let Some(bc) = self.intrabc.as_ref() {
-                        decoded_fp.push(bc.decoded[idx]);
-                        rec_fp.push(bc.rec[idx]);
+                        decoded_fp[footprint_len] = bc.decoded[idx];
+                        rec_fp[footprint_len] = bc.rec[idx];
                     }
+                    footprint_len += 1;
                 }
             }
         }
-        let mut above_fp = Vec::new();
+        let mut above_fp = [0; 16];
+        let mut above_len = 0;
         for k in 0..bw4 {
             if c + k < self.mi_cols {
-                above_fp.push(self.above_part[c + k]);
+                above_fp[above_len] = self.above_part[c + k];
+                above_len += 1;
             }
         }
-        let mut left_fp = Vec::new();
+        let mut left_fp = [0; 16];
+        let mut left_len = 0;
         for k in 0..bh4 {
             if r + k < self.mi_rows {
-                left_fp.push(self.left_part[r + k]);
+                left_fp[left_len] = self.left_part[r + k];
+                left_len += 1;
             }
         }
         Snapshot {
-            sym: self.sym.clone(),
+            sym: save_symbol_state.then(|| self.sym.clone()),
             cdfs: self.cdfs.clone(),
             intrabc_cdfs: self.intrabc.as_ref().map(|bc| bc.snapshot_cdfs()),
             cost: self.cost,
+            cost_only: self.cost_only,
             r,
             c,
             bw4,
             bh4,
+            footprint_len,
             skip_fp,
             psize_fp,
             pcolors_fp,
             decoded_fp,
             rec_fp,
+            above_len,
             above_fp,
+            left_len,
             left_fp,
         }
     }
 
     fn restore_snapshot(&mut self, snap: Snapshot) {
         // `candidates` persists (not in snapshot).
-        self.sym = snap.sym;
+        if let Some(sym) = snap.sym {
+            self.sym = sym;
+        }
         self.cdfs = snap.cdfs;
         self.cost = snap.cost;
+        self.cost_only = snap.cost_only;
         if let (Some(bc), Some(saved)) = (self.intrabc.as_mut(), snap.intrabc_cdfs) {
             bc.restore_cdfs(saved);
         }
@@ -1723,13 +1937,13 @@ impl<'a> TileEncoder<'a> {
                 let (rr, cc) = (snap.r + y, snap.c + x);
                 if rr < self.mi_rows && cc < self.mi_cols {
                     let idx = rr * self.mi_cols + cc;
-                    if i < snap.skip_fp.len() {
+                    if i < snap.footprint_len {
                         self.skip[idx] = snap.skip_fp[i];
                         self.psize[idx] = snap.psize_fp[i];
                         self.pcolors[idx] = snap.pcolors_fp[i];
                     }
                     if let Some(bc) = self.intrabc.as_mut() {
-                        if i < snap.decoded_fp.len() {
+                        if i < snap.footprint_len {
                             bc.decoded[idx] = snap.decoded_fp[i];
                             bc.rec[idx] = snap.rec_fp[i];
                         }
@@ -1738,12 +1952,14 @@ impl<'a> TileEncoder<'a> {
                 }
             }
         }
-        for (k, &v) in snap.above_fp.iter().enumerate() {
+        for k in 0..snap.above_len {
+            let v = snap.above_fp[k];
             if snap.c + k < self.mi_cols {
                 self.above_part[snap.c + k] = v;
             }
         }
-        for (k, &v) in snap.left_fp.iter().enumerate() {
+        for k in 0..snap.left_len {
+            let v = snap.left_fp[k];
             if snap.r + k < self.mi_rows {
                 self.left_part[snap.r + k] = v;
             }
@@ -1754,14 +1970,17 @@ impl<'a> TileEncoder<'a> {
     /// returning its estimated cost delta (or `Err` for illegal candidates).
     /// Restores the snapshot afterwards; increments `candidates` once per
     /// attempted trial (even on `Err`? No — only on `Ok`; illegal screened
-    /// without encoding are not counted; see callers).
+    /// without encoding are not counted; see callers). Nesting-aware: pushes
+    /// speculative depth so inner winners remain speculative relative to an
+    /// outer trial; restore returns to the enclosing depth.
     fn trial<F>(&mut self, r: usize, c: usize, bw4: usize, bh4: usize, f: F) -> io::Result<f64>
     where
         F: FnOnce(&mut Self) -> io::Result<()>,
     {
         let base_cost = self.cost;
-        let snap = self.save_snapshot(r, c, bw4, bh4);
-        self.set_speculative(true);
+        let snap = self.save_trial_snapshot(r, c, bw4, bh4);
+        self.cost_only = true;
+        self.enter_speculative();
         let res = f(self);
         let delta = self.cost - base_cost;
         self.restore_snapshot(snap);
@@ -1779,7 +1998,14 @@ impl<'a> TileEncoder<'a> {
 
     /// RDO leaf (contained 16x16): palette vs copy, no smaller partitions.
     /// Palette-only mode (`intrabc == None`) encodes palette directly.
-    fn rdo_leaf(&mut self, r: usize, c: usize, bsl: usize, top_has_right: bool) -> io::Result<()> {
+    fn rdo_leaf_with_plan(
+        &mut self,
+        r: usize,
+        c: usize,
+        bsl: usize,
+        top_has_right: bool,
+        mut plan: Option<&mut PartitionPlan>,
+    ) -> io::Result<()> {
         debug_assert_eq!(bsl, 2);
         let bw4 = 4usize;
         if self.intrabc.is_none() {
@@ -1789,8 +2015,16 @@ impl<'a> TileEncoder<'a> {
             self.enc_part(bsl, ctx, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
             self.block_with_force(r, c, bsl, top_has_right, None, true)?;
+            if let Some(plan) = plan.as_deref_mut() {
+                plan.push(PlanDecision::Palette);
+            }
             return Ok(());
         }
+        // Preserve the enclosing speculative depth: when invoked inside a
+        // parent trial the winner remains speculative relative to the parent.
+        // Trials below push depth and restore to this value; the committed
+        // re-encode runs at this depth (not unconditionally 0).
+        let outer_depth = self.speculative_depth();
         let pal_legal = self.palette_legal(r, c, bw4);
         // Copy availability is determined inside the copy trial (speculative
         // search from the same base state); no live-state search here so
@@ -1822,17 +2056,13 @@ impl<'a> TileEncoder<'a> {
             // pollute stats on miss. Instead, search inside the trial and,
             // on hit, record the MV for the later committed encode (which
             // will re-search deterministically to the same MV).
-            // First, speculative availability check (no live mutation):
-            let snap = self.save_snapshot(r, c, bw4, bw4);
-            self.set_speculative(true);
+            // `intrabc_match` is read-only apart from diagnostics. Mark this
+            // availability query speculative without snapshotting encoder
+            // state or cloning the arithmetic coder.
+            let outer_depth = self.speculative_depth();
+            self.enter_speculative();
             let m = self.intrabc_match(r, c, bw4, top_has_right);
-            let base = self.cost;
-            let _ = base;
-            self.restore_snapshot(snap);
-            // Note: availability check above touched only `cost`? No,
-            // `intrabc_match` is `&self` (no mutation except stats, which
-            // were suppressed). `save/restore` around it is belt-and-braces
-            // for future mutating searches; currently only stats suppressed.
+            self.restore_speculative(outer_depth);
             // Now trial-encode the copy if available.
             match m {
                 None => None,
@@ -1870,32 +2100,49 @@ impl<'a> TileEncoder<'a> {
                 )));
             }
         };
-        // Committed re-encode (non-speculative, exact stats).
-        self.set_speculative(false);
+        // Committed re-encode at the enclosing depth (speculative when nested,
+        // committed when top-level). Preserves the parent trial's state so
+        // rejected branches never increment committed-path counters.
+        debug_assert_eq!(
+            self.speculative_depth(),
+            outer_depth,
+            "trials must restore enclosing depth"
+        );
+        self.restore_speculative(outer_depth);
         if use_palette {
             let ctx = self.partition_ctx(r, c, bsl);
             self.enc_part(bsl, ctx, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
             self.block_with_force(r, c, bsl, top_has_right, None, true)?;
+            if let Some(plan) = plan.as_deref_mut() {
+                plan.push(PlanDecision::Palette);
+            }
         } else {
             let (_, mv_pred) = copy_trial.expect("copy must exist when chosen");
-            // Re-search deterministically for the committed MV (same base
-            // state ⇒ same result as the trial's speculative search).
-            let m = self
-                .intrabc_match(r, c, bw4, top_has_right)
-                .expect("committed copy search must reproduce trial hit");
-            debug_assert_eq!(m, mv_pred, "RDO copy MV must be deterministic");
             let ctx = self.partition_ctx(r, c, bsl);
             self.enc_part(bsl, ctx, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
             let sctx = self.skip_ctx(r, c);
             self.enc_skip(sctx, 1);
-            self.encode_copy(r, c, bsl, bw4, m.0 .0, m.0 .1, m.1 .0, m.1 .1)?;
+            self.encode_copy(
+                r,
+                c,
+                bsl,
+                bw4,
+                mv_pred.0 .0,
+                mv_pred.0 .1,
+                mv_pred.1 .0,
+                mv_pred.1 .1,
+            )?;
+            if let Some(plan) = plan {
+                plan.push(PlanDecision::Copy(mv_pred));
+            }
         }
         Ok(())
     }
 
     /// RDO for fully contained 32x32/64x64: NONE+palette, NONE+copy, SPLIT.
+    #[cfg(test)]
     fn rdo_contained(
         &mut self,
         r: usize,
@@ -1904,8 +2151,22 @@ impl<'a> TileEncoder<'a> {
         bsl: usize,
         top_has_right: bool,
     ) -> io::Result<()> {
+        self.rdo_contained_with_plan(r, c, bw4, bsl, top_has_right, None)
+    }
+
+    fn rdo_contained_with_plan(
+        &mut self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        bsl: usize,
+        top_has_right: bool,
+        mut plan: Option<&mut PartitionPlan>,
+    ) -> io::Result<()> {
         debug_assert!(bw4 == 8 || bw4 == 16);
         debug_assert!(r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols);
+        // Preserve the enclosing speculative depth (see `rdo_leaf`).
+        let outer_depth = self.speculative_depth();
         // Palette-only mode: palette vs split.
         if self.intrabc.is_none() {
             let pal_legal = self.palette_legal(r, c, bw4);
@@ -1914,14 +2175,34 @@ impl<'a> TileEncoder<'a> {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_SPLIT);
                 let half = bw4 >> 1;
-                self.rdo_partition(r, c, half, Self::child_top_right(0, top_has_right))?;
-                self.rdo_partition(r, c + half, half, Self::child_top_right(1, top_has_right))?;
-                self.rdo_partition(r + half, c, half, Self::child_top_right(2, top_has_right))?;
-                self.rdo_partition(
+                Self::record_plan(&mut plan, PlanDecision::Split);
+                self.rdo_partition_with_plan(
+                    r,
+                    c,
+                    half,
+                    Self::child_top_right(0, top_has_right),
+                    plan.as_deref_mut(),
+                )?;
+                self.rdo_partition_with_plan(
+                    r,
+                    c + half,
+                    half,
+                    Self::child_top_right(1, top_has_right),
+                    plan.as_deref_mut(),
+                )?;
+                self.rdo_partition_with_plan(
+                    r + half,
+                    c,
+                    half,
+                    Self::child_top_right(2, top_has_right),
+                    plan.as_deref_mut(),
+                )?;
+                self.rdo_partition_with_plan(
                     r + half,
                     c + half,
                     half,
                     Self::child_top_right(3, top_has_right),
+                    plan.as_deref_mut(),
                 )?;
                 return Ok(());
             }
@@ -1932,41 +2213,62 @@ impl<'a> TileEncoder<'a> {
                 enc.update_partition_ctx(r, c, bsl);
                 enc.block_with_force(r, c, bsl, top_has_right, None, true)
             })?;
+            let mut split_plan = PartitionPlan::new();
             let split_cost = self.trial(r, c, bw4, bw4, |enc| {
                 let ctx = enc.partition_ctx(r, c, bsl);
                 enc.enc_part(bsl, ctx, PARTITION_SPLIT);
                 let half = bw4 >> 1;
-                enc.rdo_partition(r, c, half, Self::child_top_right(0, top_has_right))?;
-                enc.rdo_partition(r, c + half, half, Self::child_top_right(1, top_has_right))?;
-                enc.rdo_partition(r + half, c, half, Self::child_top_right(2, top_has_right))?;
-                enc.rdo_partition(
+                enc.rdo_partition_with_plan(
+                    r,
+                    c,
+                    half,
+                    Self::child_top_right(0, top_has_right),
+                    Some(&mut split_plan),
+                )?;
+                enc.rdo_partition_with_plan(
+                    r,
+                    c + half,
+                    half,
+                    Self::child_top_right(1, top_has_right),
+                    Some(&mut split_plan),
+                )?;
+                enc.rdo_partition_with_plan(
+                    r + half,
+                    c,
+                    half,
+                    Self::child_top_right(2, top_has_right),
+                    Some(&mut split_plan),
+                )?;
+                enc.rdo_partition_with_plan(
                     r + half,
                     c + half,
                     half,
                     Self::child_top_right(3, top_has_right),
+                    Some(&mut split_plan),
                 )
             })?;
             const EPS: f64 = 1e-9;
-            self.set_speculative(false);
+            debug_assert_eq!(
+                self.speculative_depth(),
+                outer_depth,
+                "trials must restore enclosing depth"
+            );
+            self.restore_speculative(outer_depth);
             if split_cost < pal_cost - EPS {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_SPLIT);
-                let half = bw4 >> 1;
-                self.rdo_partition(r, c, half, Self::child_top_right(0, top_has_right))?;
-                self.rdo_partition(r, c + half, half, Self::child_top_right(1, top_has_right))?;
-                self.rdo_partition(r + half, c, half, Self::child_top_right(2, top_has_right))?;
-                self.rdo_partition(
-                    r + half,
-                    c + half,
-                    half,
-                    Self::child_top_right(3, top_has_right),
-                )?;
+                self.apply_plan_children(r, c, bw4, top_has_right, &split_plan)?;
+                Self::record_plan(&mut plan, PlanDecision::Split);
+                if let Some(plan) = plan {
+                    plan.extend(&split_plan);
+                }
             } else {
                 // Tie → palette (deterministic).
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
                 self.block_with_force(r, c, bsl, top_has_right, None, true)?;
+                Self::record_plan(&mut plan, PlanDecision::Palette);
             }
             return Ok(());
         }
@@ -1986,10 +2288,10 @@ impl<'a> TileEncoder<'a> {
         // Copy availability via speculative peek (no live mutation), then
         // trial-encode if available.
         let copy_info: Option<BcMatch> = {
-            let snap = self.save_snapshot(r, c, bw4, bw4);
-            self.set_speculative(true);
+            let outer_depth = self.speculative_depth();
+            self.enter_speculative();
             let m = self.intrabc_match(r, c, bw4, top_has_right);
-            self.restore_snapshot(snap);
+            self.restore_speculative(outer_depth);
             m
         };
         let copy_cost: Option<CopyCost> = match copy_info {
@@ -2015,18 +2317,38 @@ impl<'a> TileEncoder<'a> {
                 .map(|d| (d, mv_pred))
                 .ok(),
         };
+        let mut split_plan = PartitionPlan::new();
         let split_cost: Option<f64> = match self.trial(r, c, bw4, bw4, |enc| {
             let ctx = enc.partition_ctx(r, c, bsl);
             enc.enc_part(bsl, ctx, PARTITION_SPLIT);
             let half = bw4 >> 1;
-            enc.rdo_partition(r, c, half, Self::child_top_right(0, top_has_right))?;
-            enc.rdo_partition(r, c + half, half, Self::child_top_right(1, top_has_right))?;
-            enc.rdo_partition(r + half, c, half, Self::child_top_right(2, top_has_right))?;
-            enc.rdo_partition(
+            enc.rdo_partition_with_plan(
+                r,
+                c,
+                half,
+                Self::child_top_right(0, top_has_right),
+                Some(&mut split_plan),
+            )?;
+            enc.rdo_partition_with_plan(
+                r,
+                c + half,
+                half,
+                Self::child_top_right(1, top_has_right),
+                Some(&mut split_plan),
+            )?;
+            enc.rdo_partition_with_plan(
+                r + half,
+                c,
+                half,
+                Self::child_top_right(2, top_has_right),
+                Some(&mut split_plan),
+            )?;
+            enc.rdo_partition_with_plan(
                 r + half,
                 c + half,
                 half,
                 Self::child_top_right(3, top_has_right),
+                Some(&mut split_plan),
             )
         }) {
             Ok(d) => Some(d),
@@ -2067,40 +2389,147 @@ impl<'a> TileEncoder<'a> {
             best = Pick::Split;
         }
         let _ = best_cost;
-        self.set_speculative(false);
+        debug_assert_eq!(
+            self.speculative_depth(),
+            outer_depth,
+            "trials must restore enclosing depth"
+        );
+        self.restore_speculative(outer_depth);
         match best {
             Pick::Palette => {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
                 self.block_with_force(r, c, bsl, top_has_right, None, true)?;
+                Self::record_plan(&mut plan, PlanDecision::Palette);
             }
             Pick::Copy => {
                 let (_, mv_pred) = copy_cost.expect("copy must exist when chosen");
-                let m = self
-                    .intrabc_match(r, c, bw4, top_has_right)
-                    .expect("committed copy must reproduce trial hit");
-                debug_assert_eq!(m, mv_pred, "RDO copy MV deterministic");
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
                 let sctx = self.skip_ctx(r, c);
                 self.enc_skip(sctx, 1);
-                self.encode_copy(r, c, bsl, bw4, m.0 .0, m.0 .1, m.1 .0, m.1 .1)?;
+                self.encode_copy(
+                    r,
+                    c,
+                    bsl,
+                    bw4,
+                    mv_pred.0 .0,
+                    mv_pred.0 .1,
+                    mv_pred.1 .0,
+                    mv_pred.1 .1,
+                )?;
+                Self::record_plan(&mut plan, PlanDecision::Copy(mv_pred));
             }
             Pick::Split => {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.enc_part(bsl, ctx, PARTITION_SPLIT);
-                let half = bw4 >> 1;
-                self.rdo_partition(r, c, half, Self::child_top_right(0, top_has_right))?;
-                self.rdo_partition(r, c + half, half, Self::child_top_right(1, top_has_right))?;
-                self.rdo_partition(r + half, c, half, Self::child_top_right(2, top_has_right))?;
-                self.rdo_partition(
-                    r + half,
-                    c + half,
-                    half,
-                    Self::child_top_right(3, top_has_right),
+                self.apply_plan_children(r, c, bw4, top_has_right, &split_plan)?;
+                Self::record_plan(&mut plan, PlanDecision::Split);
+                if let Some(plan) = plan {
+                    plan.extend(&split_plan);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_plan(plan: &mut Option<&mut PartitionPlan>, decision: PlanDecision) {
+        if let Some(plan) = plan.as_deref_mut() {
+            plan.push(decision);
+        }
+    }
+
+    /// Re-emit the four child choices selected by the winning split trial.
+    /// The plan was produced from the same incoming coder/CDF/neighbour and
+    /// decoded-availability state, so replaying it preserves symbol order and
+    /// avoids repeating the child searches.
+    fn apply_plan_children(
+        &mut self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+        plan: &PartitionPlan,
+    ) -> io::Result<()> {
+        let half = bw4 >> 1;
+        let mut cursor = 0;
+        for (child_r, child_c, child_idx) in [
+            (r, c, 0),
+            (r, c + half, 1),
+            (r + half, c, 2),
+            (r + half, c + half, 3),
+        ] {
+            self.apply_plan_node(
+                child_r,
+                child_c,
+                half,
+                Self::child_top_right(child_idx, top_has_right),
+                plan,
+                &mut cursor,
+            )?;
+        }
+        assert_eq!(cursor, plan.len, "partition plan has trailing decisions");
+        Ok(())
+    }
+
+    fn apply_plan_node(
+        &mut self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+        plan: &PartitionPlan,
+        cursor: &mut usize,
+    ) -> io::Result<()> {
+        debug_assert!(r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols);
+        let decision = plan.nodes[*cursor].expect("partition plan ended before a node");
+        *cursor += 1;
+        let bsl = bw4.trailing_zeros() as usize;
+        match decision {
+            PlanDecision::Palette => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                self.block_with_force(r, c, bsl, top_has_right, None, true)?;
+            }
+            PlanDecision::Copy(mv_pred) => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                let sctx = self.skip_ctx(r, c);
+                self.enc_skip(sctx, 1);
+                self.encode_copy(
+                    r,
+                    c,
+                    bsl,
+                    bw4,
+                    mv_pred.0 .0,
+                    mv_pred.0 .1,
+                    mv_pred.1 .0,
+                    mv_pred.1 .1,
                 )?;
+            }
+            PlanDecision::Split => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_SPLIT);
+                let half = bw4 >> 1;
+                for (child_r, child_c, child_idx) in [
+                    (r, c, 0),
+                    (r, c + half, 1),
+                    (r + half, c, 2),
+                    (r + half, c + half, 3),
+                ] {
+                    self.apply_plan_node(
+                        child_r,
+                        child_c,
+                        half,
+                        Self::child_top_right(child_idx, top_has_right),
+                        plan,
+                        cursor,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -2116,6 +2545,17 @@ impl<'a> TileEncoder<'a> {
         bw4: usize,
         top_has_right: bool,
     ) -> io::Result<()> {
+        self.rdo_partition_with_plan(r, c, bw4, top_has_right, None)
+    }
+
+    fn rdo_partition_with_plan(
+        &mut self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+        plan: Option<&mut PartitionPlan>,
+    ) -> io::Result<()> {
         if r >= self.mi_rows || c >= self.mi_cols {
             return Ok(());
         }
@@ -2123,10 +2563,10 @@ impl<'a> TileEncoder<'a> {
         if bw4 == 4 {
             // Leaves tile exactly on 16-aligned images; still guard bounds.
             // Contained leaves use RDO; offscreen returns (unreachable).
-            return self.rdo_leaf(r, c, bsl, top_has_right);
+            return self.rdo_leaf_with_plan(r, c, bsl, top_has_right, plan);
         }
         if r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols {
-            return self.rdo_contained(r, c, bw4, bsl, top_has_right);
+            return self.rdo_contained_with_plan(r, c, bw4, bsl, top_has_right, plan);
         }
         // Edge path (unchanged): split_or bools or forced SPLIT, never NONE.
         let half = bw4 >> 1;
@@ -2631,23 +3071,25 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
     let base_bytes =
         write_isobmff(&base_image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))?;
     // RDO file (cost-based partitions, same container).
-    let rdo_bytes = match encode_obu_payload_rdo(gray, w, h) {
-        Ok((rdo_payload, rdo_av1c)) => {
-            let rdo_image = IsoBmffImage {
-                major_brand: *b"avif",
-                minor_version: 0,
-                compatible_brands: vec![*b"avif", *b"mif1", *b"miaf"],
-                primary_item_id: 1,
-                items: vec![av01_item(1, w, h, rdo_payload, rdo_av1c)],
-                groups: vec![],
-            };
-            write_isobmff(&rdo_image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))?
-        }
+    let rdo_bytes = match (|| -> io::Result<Vec<u8>> {
+        let (rdo_payload, rdo_av1c) = encode_obu_payload_rdo(gray, w, h)?;
+        let rdo_image = IsoBmffImage {
+            major_brand: *b"avif",
+            minor_version: 0,
+            compatible_brands: vec![*b"avif", *b"mif1", *b"miaf"],
+            primary_item_id: 1,
+            items: vec![av01_item(1, w, h, rdo_payload, rdo_av1c)],
+            groups: vec![],
+        };
+        write_isobmff(&rdo_image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
+    })() {
+        Ok(bytes) => bytes,
         Err(_) => {
             // RDO must succeed whenever baseline does (same legality);
-            // on unexpected RDO failure, fall back to baseline.
+            // on unexpected RDO failure, fall back to baseline but count it
+            // separately so fallback does not conceal errors.
             use std::sync::atomic::Ordering;
-            BASELINE_WINS.fetch_add(1, Ordering::Relaxed);
+            RDO_ERRORS.fetch_add(1, Ordering::Relaxed);
             return Ok(base_bytes);
         }
     };
@@ -2669,9 +3111,9 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
 /// them as alternatives and display the primary by default (AVIF §5.1).
 /// Each item carries its own `ispe`/`av1C` (levels may differ: 2.0 vs 4.0).
 ///
-/// Whole-image fallback like `encode_gray`: baseline and RDO complete
-/// serialized pair files are compared and the smaller kept (baseline on
-/// ties), so per-file wins are reported via the same globals.
+/// Baseline and RDO payloads are produced once for each raster, then each
+/// available combination is serialized as a complete AVIF. The smallest
+/// file wins, with deterministic baseline-first tie ordering.
 ///
 /// Each raster has the same supported-input constraints as `encode_gray`;
 /// violations return `InvalidInput`.
@@ -2683,17 +3125,111 @@ pub fn encode_gray_pair(
     lw: u32,
     lh: u32,
 ) -> io::Result<Vec<u8>> {
-    // Baseline pair file.
-    let (base_small_payload, base_small_av1c) = encode_obu_payload(small, sw, sh)?;
-    let (base_large_payload, base_large_av1c) = encode_obu_payload(large, lw, lh)?;
-    let base_image = IsoBmffImage {
+    let base_small = encode_obu_payload(small, sw, sh)?;
+    let base_large = encode_obu_payload(large, lw, lh)?;
+    // Preserve the whole-file baseline safeguard, but make the RDO choice
+    // independently for each item using only payloads already encoded.
+    let mut had_rdo_error = false;
+    let rdo_small = match encode_obu_payload_rdo(small, sw, sh) {
+        Ok(candidate) => Some(candidate),
+        Err(_) => {
+            had_rdo_error = true;
+            RDO_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    };
+    let rdo_large = match encode_obu_payload_rdo(large, lw, lh) {
+        Ok(candidate) => Some(candidate),
+        Err(_) => {
+            had_rdo_error = true;
+            RDO_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    };
+
+    let small_candidates = [Some(base_small), rdo_small];
+    let large_candidates = [Some(base_large), rdo_large];
+    // Stable order keeps baseline/baseline on ties, then tests mixed small,
+    // mixed large, and finally RDO/RDO. Each serialization contains the
+    // complete item metadata and altr group and therefore compares exactly
+    // what will be written.
+    let mode_order = [(0usize, 0usize), (1, 0), (0, 1), (1, 1)];
+    let mut best_bytes: Option<Vec<u8>> = None;
+    let mut best_mode = (0usize, 0usize);
+    for mode in mode_order {
+        let (Some((small_payload, small_av1c)), Some((large_payload, large_av1c))) =
+            (&small_candidates[mode.0], &large_candidates[mode.1])
+        else {
+            continue;
+        };
+        let bytes = match mux_gray_pair_payloads(
+            PairPayload {
+                payload: small_payload,
+                av1c: *small_av1c,
+                width: sw,
+                height: sh,
+            },
+            PairPayload {
+                payload: large_payload,
+                av1c: *large_av1c,
+                width: lw,
+                height: lh,
+            },
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) if mode == (0, 0) => return Err(error),
+            Err(_) => {
+                had_rdo_error = true;
+                RDO_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+        };
+        if best_bytes
+            .as_ref()
+            .is_none_or(|best| bytes.len() < best.len())
+        {
+            best_bytes = Some(bytes);
+            best_mode = mode;
+        }
+    }
+    use std::sync::atomic::Ordering;
+    let selected_rdo = best_mode != (0, 0);
+    if selected_rdo {
+        RDO_WINS.fetch_add(1, Ordering::Relaxed);
+    } else if !had_rdo_error {
+        BASELINE_WINS.fetch_add(1, Ordering::Relaxed);
+    }
+    best_bytes.ok_or_else(|| io::Error::other("no encoded pair candidates"))
+}
+
+struct PairPayload<'a> {
+    payload: &'a [u8],
+    av1c: [u8; 4],
+    width: u32,
+    height: u32,
+}
+
+fn mux_gray_pair_payloads(small: PairPayload<'_>, large: PairPayload<'_>) -> io::Result<Vec<u8>> {
+    let image = IsoBmffImage {
         major_brand: *b"avif",
         minor_version: 0,
         compatible_brands: vec![*b"avif", *b"mif1", *b"miaf"],
         primary_item_id: 1,
         items: vec![
-            av01_item(1, lw, lh, base_large_payload, base_large_av1c),
-            av01_item(2, sw, sh, base_small_payload, base_small_av1c),
+            av01_item(
+                1,
+                large.width,
+                large.height,
+                large.payload.to_vec(),
+                large.av1c,
+            ),
+            av01_item(
+                2,
+                small.width,
+                small.height,
+                small.payload.to_vec(),
+                small.av1c,
+            ),
         ],
         groups: vec![EntityGroup {
             group_type: *b"altr",
@@ -2701,44 +3237,7 @@ pub fn encode_gray_pair(
             entity_ids: vec![1, 2],
         }],
     };
-    let base_bytes =
-        write_isobmff(&base_image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))?;
-    // RDO pair file (both rasters via RDO; fallback per complete file).
-    let rdo_bytes = match (|| -> io::Result<Vec<u8>> {
-        let (rdo_small_payload, rdo_small_av1c) = encode_obu_payload_rdo(small, sw, sh)?;
-        let (rdo_large_payload, rdo_large_av1c) = encode_obu_payload_rdo(large, lw, lh)?;
-        let rdo_image = IsoBmffImage {
-            major_brand: *b"avif",
-            minor_version: 0,
-            compatible_brands: vec![*b"avif", *b"mif1", *b"miaf"],
-            primary_item_id: 1,
-            items: vec![
-                av01_item(1, lw, lh, rdo_large_payload, rdo_large_av1c),
-                av01_item(2, sw, sh, rdo_small_payload, rdo_small_av1c),
-            ],
-            groups: vec![EntityGroup {
-                group_type: *b"altr",
-                group_id: 10,
-                entity_ids: vec![1, 2],
-            }],
-        };
-        write_isobmff(&rdo_image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
-    })() {
-        Ok(b) => b,
-        Err(_) => {
-            use std::sync::atomic::Ordering;
-            BASELINE_WINS.fetch_add(1, Ordering::Relaxed);
-            return Ok(base_bytes);
-        }
-    };
-    use std::sync::atomic::Ordering;
-    if rdo_bytes.len() < base_bytes.len() {
-        RDO_WINS.fetch_add(1, Ordering::Relaxed);
-        Ok(rdo_bytes)
-    } else {
-        BASELINE_WINS.fetch_add(1, Ordering::Relaxed);
-        Ok(base_bytes)
-    }
+    write_isobmff(&image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
 }
 
 #[cfg(test)]
@@ -2764,6 +3263,63 @@ mod tests {
         assert!(img.items.iter().all(|it| it.item_type == *b"av01"));
         assert_eq!(img.groups.len(), 1);
         assert_eq!(img.groups[0].group_type, *b"altr");
+    }
+
+    #[test]
+    fn pair_rdo_selects_small_and_large_items_independently() {
+        let (sw, sh) = (160u32, 144u32);
+        let (lw, lh) = (128u32, 128u32);
+        let small = vec![0u8; sw as usize * sh as usize];
+        let mut large = vec![0u8; lw as usize * lh as usize];
+        let mut state = 3u32; // deterministic random four-shade case
+        for pixel in &mut large {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *pixel = [0, 85, 170, 255][(state >> 30) as usize];
+        }
+        let (bs, bsc) = encode_obu_payload(&small, sw, sh).unwrap();
+        let (rs, rsc) = encode_obu_payload_rdo(&small, sw, sh).unwrap();
+        let (bl, blc) = encode_obu_payload(&large, lw, lh).unwrap();
+        let (rl, rlc) = encode_obu_payload_rdo(&large, lw, lh).unwrap();
+        let mux = |small_payload: &[u8],
+                   small_av1c: [u8; 4],
+                   large_payload: &[u8],
+                   large_av1c: [u8; 4]| {
+            mux_gray_pair_payloads(
+                PairPayload {
+                    payload: small_payload,
+                    av1c: small_av1c,
+                    width: sw,
+                    height: sh,
+                },
+                PairPayload {
+                    payload: large_payload,
+                    av1c: large_av1c,
+                    width: lw,
+                    height: lh,
+                },
+            )
+            .unwrap()
+        };
+        let candidates = [
+            mux(&bs, bsc, &bl, blc),
+            mux(&rs, rsc, &bl, blc),
+            mux(&bs, bsc, &rl, rlc),
+            mux(&rs, rsc, &rl, rlc),
+        ];
+        let mut expected_index = 0;
+        for index in 1..candidates.len() {
+            if candidates[index].len() < candidates[expected_index].len() {
+                expected_index = index;
+            }
+        }
+        assert_eq!(
+            expected_index, 1,
+            "fixture must select mixed RDO/base items"
+        );
+        let selected = encode_gray_pair(&small, sw, sh, &large, lw, lh).unwrap();
+        assert_eq!(selected, candidates[expected_index]);
+        assert!(selected.len() <= candidates[0].len());
+        assert!(selected.len() <= candidates[3].len());
     }
 
     #[test]
@@ -3563,7 +4119,7 @@ mod tests {
         let base_cdfs = enc.cdfs.clone();
         // Speculative trial that mutates (palette encode), then restore.
         let snap = enc.save_snapshot(0, 0, 16, 16);
-        enc.set_speculative(true);
+        enc.enter_speculative();
         // Force a palette encode (mutates sym/CDFs/neighbours/cost).
         let ctx = enc.partition_ctx(0, 0, 4);
         enc.enc_part(4, ctx, PARTITION_NONE);
@@ -3597,21 +4153,139 @@ mod tests {
         assert_eq!(enc.candidates, c0 + 1);
         assert_eq!(enc.cost, base_cost, "trial must restore cost");
         assert_eq!(enc.skip, base_skip, "trial must restore neighbours");
-        // Speculative searches leave no pattern diagnostics (per-image,
-        // test-isolated; globals would race across parallel tests).
+        // Speculative searches increment speculative (not committed)
+        // diagnostics (per-image, test-isolated; globals would race across
+        // parallel tests).
         let (q0, f0) = {
             let bc = enc.intrabc.as_ref().expect("intrabc on");
             (bc.pattern_queries(), bc.pattern_fallbacks())
         };
+        let (sq0, sf0) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_spec_queries(), bc.pattern_spec_fallbacks())
+        };
         let snap2 = enc.save_snapshot(0, 0, 4, 4);
-        enc.set_speculative(true);
+        enc.enter_speculative();
         let _ = enc.intrabc_match(0, 0, 4, true);
         enc.restore_snapshot(snap2);
         let (q1, f1) = {
             let bc = enc.intrabc.as_ref().expect("intrabc on");
             (bc.pattern_queries(), bc.pattern_fallbacks())
         };
+        let (sq1, sf1) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_spec_queries(), bc.pattern_spec_fallbacks())
+        };
         assert_eq!((q0, f0), (q1, f1), "speculative search must not count");
+        // Speculative work is counted separately (total = committed + spec).
+        // This 16x16 is uniform (flat quadrant) on a verified image, so the
+        // speculative query hits the stripe fallback path: one speculative
+        // query and one speculative fallback.
+        assert_eq!(sq1, sq0 + 1, "speculative query tracked separately");
+        assert_eq!(sf1, sf0 + 1, "speculative fallback tracked separately");
+    }
+
+    /// Nested rejected trials must not increment committed-path counters.
+    /// Regression for the `set_speculative(false)` bug: `rdo_leaf` /
+    /// `rdo_contained` unconditionally cleared speculative state when
+    /// committing their local winner, so a rejected parent trial at MI
+    /// (0,80) on IMG_01's enlarged raster changed per-image query/fallback
+    /// counters from (0,0) to (9,9). With nesting-aware depth the inner
+    /// winner remains speculative relative to the parent.
+    ///
+    /// Uses a verified 8x image with actual copy opportunities (repeating
+    /// non-stripe 16x16 pattern, wide enough for SB-delay hits) and a
+    /// rejected 64x64 parent trial containing nested palette/copy/split
+    /// trials. Distinguishes total / speculative / committed searches and
+    /// verifies ordinary baseline wins never increment the error counter.
+    #[test]
+    fn rdo_nested_rejected_trial_no_committed_counts() {
+        use super::TileEncoder;
+        // 512x64 verified 8x image: every 8x8 cell constant, each 16x16 is
+        // [[0,85],[170,255]] (non-stripe, definitive cached path), repeated
+        // so later 64x64 blocks have exact causal matches past the SB delay.
+        let (w, h) = (512usize, 64usize);
+        let mut img = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let bx = (x / 8) % 2;
+                let by = (y / 8) % 2;
+                img[y * w + x] = match (bx, by) {
+                    (0, 0) => 0,
+                    (1, 0) => 85,
+                    (0, 1) => 170,
+                    _ => 255,
+                };
+            }
+        }
+        let (_, masks) = validate_gray(&img, w as u32, h as u32).unwrap();
+        let mut enc = TileEncoder::new_with_rdo(&img, w, h, true, masks, true).unwrap();
+        {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            assert!(bc.pattern_verified(), "test image must verify");
+        }
+        // Advance committed state through the first five SBs (MI c 0..80) so
+        // MI (0,80) has decoded history and SB-delay-legal sources.
+        for c in (0..80usize).step_by(16) {
+            enc.rdo_partition(0, c, 16, true).unwrap();
+        }
+        // Copy opportunity must actually exist at the nested-trial origin.
+        assert!(
+            enc.intrabc_match(0, 80, 16, true).is_some(),
+            "test needs an actual 64x64 copy at MI (0,80)"
+        );
+        let (q0, f0) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_queries(), bc.pattern_fallbacks())
+        };
+        let (sq0, sf0) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_spec_queries(), bc.pattern_spec_fallbacks())
+        };
+        let (tq0, tf0) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_total_queries(), bc.pattern_total_fallbacks())
+        };
+        assert_eq!(tq0, q0 + sq0, "total = committed + speculative");
+        assert_eq!(tf0, f0 + sf0, "total = committed + speculative");
+        // Rejected parent trial: nested palette/copy/split trials plus inner
+        // winners (speculative relative to this trial). Restored afterwards.
+        let _ = enc
+            .trial(0, 80, 16, 16, |e| e.rdo_contained(0, 80, 16, 4, true))
+            .unwrap();
+        let (q1, f1) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_queries(), bc.pattern_fallbacks())
+        };
+        let (sq1, sf1) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_spec_queries(), bc.pattern_spec_fallbacks())
+        };
+        let (tq1, tf1) = {
+            let bc = enc.intrabc.as_ref().expect("intrabc on");
+            (bc.pattern_total_queries(), bc.pattern_total_fallbacks())
+        };
+        assert_eq!(
+            (q0, f0),
+            (q1, f1),
+            "rejected nested trial must not increment committed counters"
+        );
+        assert!(
+            (sq1, sf1) != (sq0, sf0),
+            "rejected nested trial must do speculative work (spec {sq0},{sf0} -> {sq1},{sf1})"
+        );
+        assert_eq!(tq1, q1 + sq1, "total tracks committed + speculative");
+        assert_eq!(tf1, f1 + sf1, "total tracks committed + speculative");
+        assert!(tq1 > tq0, "total work grew via speculative trials");
+        // Ordinary baseline wins (here: flat tie) never increment errors.
+        let errs_before = super::rdo_errors();
+        let flat = vec![0u8; 32 * 32];
+        let _ = super::encode_gray(&flat, 32, 32).unwrap();
+        assert_eq!(
+            super::rdo_errors(),
+            errs_before,
+            "ordinary tie must not count as RDO error"
+        );
     }
 
     /// Whole-image fallback prefers baseline on ties and keeps the smaller
@@ -3832,12 +4506,16 @@ mod tests {
             );
         }
         let (rw, bw, cands) = rdo_stats();
+        let errors = rdo_errors();
         let (q, f) = crate::mono::pattern_cache_stats();
+        let (sq, sf) = crate::mono::pattern_cache_stats_speculative();
+        let (tq, tf) = crate::mono::pattern_cache_stats_total();
         eprintln!(
-            "bench_rdo totals: rdo_wins={rw} baseline_wins={bw} candidates={cands} pattern_queries={q} fallbacks={f}"
+            "bench_rdo totals: rdo_wins={rw} baseline_wins={bw} errors={errors} candidates={cands} pattern_committed={q}/{f} pattern_speculative={sq}/{sf} pattern_total={tq}/{tf}"
         );
         eprintln!(
-            "bench_rdo memory: static=1836B masks_small=90B masks_large=5760B pattern_large<=90KiB transient_snapshot~=60KiB"
+            "bench_rdo memory: snapshot_inline={}B max_trial_depth=3; trial snapshots allocate no footprint/CDF/coder clones; masks_small=90B masks_large=5760B pattern_large<=90KiB",
+            std::mem::size_of::<Snapshot>()
         );
     }
 }

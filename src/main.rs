@@ -1,5 +1,7 @@
 use clap::Parser;
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process;
 
@@ -245,6 +247,102 @@ fn upscale_nearest(gray: &[u8], w: u32, h: u32, scale: u32) -> Vec<u8> {
     out
 }
 
+/// Every setting or property that changes the serialized AVIF identity for
+/// one rendered raster. The complete border/photo pixels are compared
+/// separately, byte-for-byte, after the hash lookup.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct EncodeIdentity {
+    small_w: u32,
+    small_h: u32,
+    scale: u32,
+    large_w: u32,
+    large_h: u32,
+    gray_levels: [u8; 4],
+    intrabc: bool,
+    rdo: bool,
+    brands: [[u8; 4]; 3],
+    primary_item_id: u32,
+    large_item_id: u32,
+    small_item_id: u32,
+    alternative_group_type: [u8; 4],
+    alternative_group_id: u32,
+}
+
+impl EncodeIdentity {
+    fn current() -> Self {
+        Self {
+            small_w: WIDTH,
+            small_h: HEIGHT,
+            scale: SCALE,
+            large_w: LARGE_W,
+            large_h: LARGE_H,
+            gray_levels: GRAY_8BIT,
+            intrabc: mono::USE_INTRABC,
+            rdo: true,
+            brands: [*b"avif", *b"mif1", *b"miaf"],
+            primary_item_id: 1,
+            large_item_id: 1,
+            small_item_id: 2,
+            alternative_group_type: *b"altr",
+            alternative_group_id: 10,
+        }
+    }
+}
+
+struct RasterGroup {
+    identity: EncodeIdentity,
+    gray: Vec<u8>,
+    slots: Vec<usize>,
+}
+
+fn raster_hash(identity: &EncodeIdentity, gray: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    gray.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn group_rendered_by<F>(rasters: Vec<(usize, EncodeIdentity, Vec<u8>)>, hash: F) -> Vec<RasterGroup>
+where
+    F: Fn(&EncodeIdentity, &[u8]) -> u64,
+{
+    let mut groups: Vec<RasterGroup> = Vec::new();
+    let mut buckets: HashMap<(EncodeIdentity, u64), Vec<usize>> = HashMap::new();
+    for (slot, identity, gray) in rasters {
+        let digest = hash(&identity, &gray);
+        let key = (identity, digest);
+        let existing = buckets.get(&key).and_then(|indices| {
+            indices
+                .iter()
+                .copied()
+                .find(|&index| groups[index].gray == gray)
+        });
+        if let Some(index) = existing {
+            groups[index].slots.push(slot);
+        } else {
+            let index = groups.len();
+            groups.push(RasterGroup {
+                identity,
+                gray,
+                slots: vec![slot],
+            });
+            buckets.entry(key).or_default().push(index);
+        }
+    }
+    groups
+}
+
+fn group_rendered(rasters: Vec<(usize, Vec<u8>)>) -> Vec<RasterGroup> {
+    let identity = EncodeIdentity::current();
+    group_rendered_by(
+        rasters
+            .into_iter()
+            .map(|(slot, gray)| (slot, identity, gray))
+            .collect(),
+        raster_hash,
+    )
+}
+
 fn run(args: Args) -> Result<(), String> {
     let save = std::fs::read(&args.save).map_err(|e| {
         format!(
@@ -342,46 +440,64 @@ fn run(args: Args) -> Result<(), String> {
     // intra-run collision check above, which always fails instead of
     // overwriting a file written earlier in the same run.
 
-    // Independent slots are a natural unit of bounded parallel work:
-    // output names are pre-validated unique above, and each iteration
-    // only reads shared inputs (`save`, `rom`) while writing its own
-    // file. Per-photo scratch is bounded after the encoder-side fixes
-    // (no search-ring/index/cache heaps), so peak memory stays flat.
-    (1..31usize).into_par_iter().try_for_each(|slot_num| {
-        let base_address = slot_num_to_base_address(slot_num);
-        let frame_number = *save.get(base_address + 0xfb0).ok_or_else(|| {
-            format!(
-                "save '{}': slot {slot_num} frame offset {:#x} out of bounds (save len {})",
-                args.save.display(),
-                base_address + 0xfb0,
-                save.len()
-            )
-        })? as i32;
-        let frame = rom_ref.map(|r| {
-            let (addr, idx) = frame_base_address(r, frame_number);
-            FrameInfo {
-                addr,
-                idx,
-                is_hk: is_hk_rom(r),
-            }
-        });
-        let rom_tuple: Option<(&[u8], &FrameInfo)> = match (&rom_ref, &frame) {
-            (Some(r), Some(f)) => Some((r, f)),
-            _ => None,
-        };
-
-        let gray = render_photo(rom_tuple, &save, base_address);
-        let large = upscale_nearest(&gray, WIDTH, HEIGHT, SCALE);
-        let avif = mono::encode_gray_pair(&gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H).map_err(
-            |e| {
+    // Render every slot first, then group identical full-canvas grayscale
+    // rasters. The grouping is extraction-local; its hash bucket is always
+    // checked with exact pixel equality before sharing encoded bytes.
+    let mut rendered: Vec<(usize, Vec<u8>)> = (1..31usize)
+        .into_par_iter()
+        .map(|slot_num| {
+            let base_address = slot_num_to_base_address(slot_num);
+            let frame_number = *save.get(base_address + 0xfb0).ok_or_else(|| {
                 format!(
-                    "couldn't encode slot {slot_num} ({}): {e}",
-                    filenames[slot_num - 1]
+                    "save '{}': slot {slot_num} frame offset {:#x} out of bounds (save len {})",
+                    args.save.display(),
+                    base_address + 0xfb0,
+                    save.len()
                 )
-            },
-        )?;
-        let filename = &filenames[slot_num - 1];
-        std::fs::write(filename, &avif).map_err(|e| format!("couldn't write '{filename}': {e}"))?;
+            })? as i32;
+            let frame = rom_ref.map(|r| {
+                let (addr, idx) = frame_base_address(r, frame_number);
+                FrameInfo {
+                    addr,
+                    idx,
+                    is_hk: is_hk_rom(r),
+                }
+            });
+            let rom_tuple: Option<(&[u8], &FrameInfo)> = match (&rom_ref, &frame) {
+                (Some(r), Some(f)) => Some((r, f)),
+                _ => None,
+            };
+
+            Ok::<_, String>((slot_num, render_photo(rom_tuple, &save, base_address)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rendered.sort_unstable_by_key(|(slot_num, _)| *slot_num);
+    let groups = group_rendered(rendered);
+    eprintln!(
+        "gbcamextract: {} unique rendered rasters for 30 slots ({} duplicate slots reused)",
+        groups.len(),
+        30 - groups.len()
+    );
+
+    // Encoding remains bounded by the configured Rayon pool. Every group is
+    // encoded once and the resulting bytes are written to all of its
+    // pre-validated, distinct output names.
+    groups.into_par_iter().try_for_each(|group| {
+        let first_slot = group.slots[0];
+        let large = upscale_nearest(&group.gray, WIDTH, HEIGHT, SCALE);
+        let avif = mono::encode_gray_pair(&group.gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H)
+            .map_err(|e| {
+                format!(
+                    "couldn't encode slot {first_slot} ({}): {e}",
+                    filenames[first_slot - 1]
+                )
+            })?;
+        debug_assert_eq!(group.identity, EncodeIdentity::current());
+        for slot_num in group.slots {
+            let filename = &filenames[slot_num - 1];
+            std::fs::write(filename, &avif)
+                .map_err(|e| format!("couldn't write '{filename}': {e}"))?;
+        }
         Ok::<(), String>(())
     })?;
     Ok(())
@@ -392,5 +508,30 @@ fn main() {
     if let Err(e) = run(args) {
         eprintln!("gbcamextract: {e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raster_grouping_checks_exact_pixels_and_encoder_identity() {
+        let identity = EncodeIdentity::current();
+        let mut other_identity = identity;
+        other_identity.scale += 1;
+        let groups = group_rendered_by(
+            vec![
+                (1, identity, vec![0, 85, 170, 255]),
+                (2, identity, vec![0, 85, 170, 255]),
+                (3, identity, vec![0, 85, 170, 254]),
+                (4, other_identity, vec![0, 85, 170, 255]),
+            ],
+            |_, _| 0, // Force a collision to exercise exact equality.
+        );
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].slots, [1, 2]);
+        assert_eq!(groups[1].slots, [3]);
+        assert_eq!(groups[2].slots, [4]);
     }
 }
