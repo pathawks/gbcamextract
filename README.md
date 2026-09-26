@@ -11,7 +11,7 @@ gbcamextract [-r rom.gb] -s save.sav
 
 This will produce 30 PNG files containing your photos. It is optional to specify the rom; this will allow the picture frames to be extracted too.
 
-## Building (Rust)
+## Building
 
 ```console
 cargo build --release
@@ -20,20 +20,6 @@ cargo build --release
 The binary is at `target/release/gbcamextract`. No system libraries are
 needed: PNG encoding is done with the pure-Rust `png` crate, and argument
 parsing with `clap`.
-
-## Building (legacy C)
-
-You will first need to install [libpng](http://www.libpng.org/pub/png/libpng.html).
-
-Then, for Linux:
-```console
-make
-```
-
-Or for Windows:
-```console
-mingw32-make -f Makefile.win
-```
 
 
 ## License
