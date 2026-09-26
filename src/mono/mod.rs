@@ -46,6 +46,19 @@ use intrabc::IntrabcState;
 /// header bit).
 const USE_INTRABC: bool = true;
 
+/// `InvalidInput` helper for supported-input violations at the boundary.
+fn invalid_input(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// Checked pixel area `w * h`, returning `InvalidInput` on overflow
+/// instead of wrapping.
+fn checked_area(w: u32, h: u32) -> io::Result<usize> {
+    (w as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| invalid_input(format!("pixel area overflows usize: {w}x{h}")))
+}
+
 // ---------------------------------------------------------------------------
 // Default CDF tables (AV1 §9.3/§9.4), transcribed for the symbols we emit.
 // ---------------------------------------------------------------------------
@@ -271,11 +284,16 @@ impl Cdfs {
         }
     }
 
+    /// Palette index CDF row for `n` colors. Only 2..4 exist (the
+    /// transcribed `Palette_Size_N_Y_Color` tables); callers validate
+    /// `psize` at the boundary/`block()` and return `InvalidInput`
+    /// otherwise, so larger sizes never reach here.
     fn pal_idx(&mut self, n: usize, ctx: usize) -> &mut AdaptCdf {
         match n {
             2 => &mut self.pal_idx2[ctx],
             3 => &mut self.pal_idx3[ctx],
-            _ => &mut self.pal_idx4[ctx],
+            4 => &mut self.pal_idx4[ctx],
+            _ => unreachable!("palette size {n} has no index CDF (supported: 2..4)"),
         }
     }
 }
@@ -356,11 +374,20 @@ const AL_PART_NONE_ABOVE: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 const AL_PART_NONE_LEFT: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 
 impl<'a> TileEncoder<'a> {
-    fn new(px: &'a [u8], w: usize, h: usize, use_intrabc: bool) -> Self {
-        assert!(w.is_multiple_of(16) && h.is_multiple_of(16), "dimensions must be 16-aligned");
+    fn new(px: &'a [u8], w: usize, h: usize, use_intrabc: bool) -> io::Result<Self> {
+        if w > u32::MAX as usize || h > u32::MAX as usize {
+            return Err(invalid_input(format!(
+                "dimensions exceed u32 range, got {w}x{h}"
+            )));
+        }
+        // `w`/`h` fit in `u32` here.
+        check_supported_dimensions(w as u32, h as u32)?;
         let mi_cols = w / 4;
         let mi_rows = h / 4;
-        Self {
+        let mi_area = mi_cols.checked_mul(mi_rows).ok_or_else(|| {
+            invalid_input(format!("MI grid area overflows usize: {mi_cols}x{mi_rows}"))
+        })?;
+        Ok(Self {
             px,
             w,
             h,
@@ -369,13 +396,13 @@ impl<'a> TileEncoder<'a> {
             sym: SymbolEncoder::new(),
             cdfs: Cdfs::new(),
             intrabc: use_intrabc.then(|| IntrabcState::new(mi_cols, mi_rows)),
-            ymode: vec![0; mi_cols * mi_rows],
-            skip: vec![0; mi_cols * mi_rows],
-            psize: vec![0; mi_cols * mi_rows],
-            pcolors: vec![[0u8; 8]; mi_cols * mi_rows],
+            ymode: vec![0; mi_area],
+            skip: vec![0; mi_area],
+            psize: vec![0; mi_area],
+            pcolors: vec![[0u8; 8]; mi_area],
             above_part: vec![0; mi_cols],
             left_part: vec![0; mi_rows],
-        }
+        })
     }
 
     fn sample(&self, x: usize, y: usize) -> u8 {
@@ -452,17 +479,23 @@ impl<'a> TileEncoder<'a> {
     /// existing edge (split_or / forced-split) path, never `NONE`.
     /// `top_has_right` is the decoder edge flag for this node (SB roots
     /// start set, mirroring the generated tree root).
-    fn partition(&mut self, r: usize, c: usize, bw4: usize, top_has_right: bool) {
+    fn partition(
+        &mut self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+    ) -> io::Result<()> {
         if r >= self.mi_rows || c >= self.mi_cols {
-            return;
+            return Ok(());
         }
         let bsl = bw4.trailing_zeros() as usize;
         if bw4 == 4 {
             let ctx = self.partition_ctx(r, c, bsl);
             self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
-            self.block(r, c, bsl, top_has_right);
-            return;
+            self.block(r, c, bsl, top_has_right)?;
+            return Ok(());
         }
         // Contained nodes: flat regions always take NONE (palette beats a
         // copy for a single level); with IntraBC off, anything paletteable
@@ -483,8 +516,8 @@ impl<'a> TileEncoder<'a> {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
-                self.block(r, c, bsl, top_has_right);
-                return;
+                self.block(r, c, bsl, top_has_right)?;
+                return Ok(());
             }
         }
         let half = bw4 >> 1;
@@ -514,25 +547,26 @@ impl<'a> TileEncoder<'a> {
             self.sym.encode_symbol(1, &[c0, 32768]);
         }
         // Forced SPLIT (neither flag) codes no symbol.
-        self.partition(r, c, half, Self::child_top_right(0, top_has_right));
+        self.partition(r, c, half, Self::child_top_right(0, top_has_right))?;
         self.partition(
             r,
             c + half,
             half,
             Self::child_top_right(1, top_has_right),
-        );
+        )?;
         self.partition(
             r + half,
             c,
             half,
             Self::child_top_right(2, top_has_right),
-        );
+        )?;
         self.partition(
             r + half,
             c + half,
             half,
             Self::child_top_right(3, top_has_right),
-        );
+        )?;
+        Ok(())
     }
 
     fn skip_ctx(&self, r: usize, c: usize) -> usize {
@@ -634,9 +668,15 @@ impl<'a> TileEncoder<'a> {
     /// IntraBC is enabled and an exact causal match exists — an intrabc
     /// copy (`skip = 1`, integer MV, no residuals). Palette mode is
     /// legal at all three sizes (dav1d gates it on `imax(bw4, bh4) <= 16`
-    /// MI); the index tables only cover sizes 2..4, so callers must keep
-    /// distinct levels ≤ 4.
-    fn block(&mut self, r: usize, c: usize, bsl: usize, top_has_right: bool) {
+    /// MI); the index tables only cover sizes 2..4, so the palette path
+    /// returns `InvalidInput` for any other distinct count.
+    fn block(
+        &mut self,
+        r: usize,
+        c: usize,
+        bsl: usize,
+        top_has_right: bool,
+    ) -> io::Result<()> {
         let bw: usize = 4 << bsl;
         let (sx, sy) = (c * 4, r * 4);
         let bw4 = 1usize << bsl;
@@ -652,7 +692,11 @@ impl<'a> TileEncoder<'a> {
         }
         let distinct = set.iter().filter(|&&b| b).count();
         let mut colors: Vec<u8> = (0..256).filter(|&v| set[v]).map(|v| v as u8).collect();
-        assert!(!colors.is_empty() && colors.len() <= 8);
+        if colors.is_empty() {
+            return Err(invalid_input(format!(
+                "empty palette block at MI ({r},{c}) size {bw}x{bw}"
+            )));
+        }
         // A flat block still needs a 2-entry table. Prefer padding with a
         // cached level (nearly free via a reuse flag below) over an
         // adjacent level (short delta chain); either way the pad value is
@@ -690,7 +734,11 @@ impl<'a> TileEncoder<'a> {
             // decoder's predictor (replicated refmvs search). No mode,
             // palette, or index symbols; dav1d records DC/empty palette
             // contexts for neighbours, mirrored in bookkeeping below.
-            let bc = self.intrabc.as_mut().unwrap();
+            let Some(bc) = self.intrabc.as_mut() else {
+                return Err(io::Error::other(
+                    "internal: IntraBC match without IntraBC state",
+                ));
+            };
             bc.flag(&mut self.sym, true);
             let ((py, px_), _) = bc.predictor(r, c, bw4, bw4, top_has_right);
             bc.encode_mvd(&mut self.sym, my, mx, py, px_);
@@ -705,12 +753,18 @@ impl<'a> TileEncoder<'a> {
             }
             self.intrabc
                 .as_mut()
-                .unwrap()
+                .ok_or_else(|| io::Error::other("internal: missing IntraBC state"))?
                 .record(r, c, bw4, bw4, Some((my, mx)));
-            return;
+            return Ok(());
         }
-        if self.intrabc.is_some() {
-            self.intrabc.as_mut().unwrap().flag(&mut self.sym, false);
+        // Palette path: the index CDFs only support 2..4 colors.
+        if !(2..=4).contains(&psize) {
+            return Err(invalid_input(format!(
+                "unsupported palette size {psize} in {bw}x{bw} block at ({sx},{sy}): encoder supports 2..4 colors per palette-coded block"
+            )));
+        }
+        if let Some(bc) = &mut self.intrabc {
+            bc.flag(&mut self.sym, false);
         }
 
         let mut index_map = vec![0u8; bw * bw];
@@ -775,7 +829,7 @@ impl<'a> TileEncoder<'a> {
                         need = need.max(d.ilog2() + 1);
                     }
                 }
-                let need = need.max(5).min(8);
+                let need = need.clamp(5, 8);
                 self.sym.encode_literal(need - 5, 2);
                 let mut palette_bits = need;
                 for k in 1..new_colors.len() {
@@ -810,11 +864,8 @@ impl<'a> TileEncoder<'a> {
         // Mirror dav1d's `splat_intraref`: palette blocks contribute no
         // motion candidate (and mark the footprint decoded for match
         // search) exactly like the decoder's `rt` grid.
-        if self.intrabc.is_some() {
-            self.intrabc
-                .as_mut()
-                .unwrap()
-                .record(r, c, bw4, bw4, None);
+        if let Some(bc) = &mut self.intrabc {
+            bc.record(r, c, bw4, bw4, None);
         }
 
         // color_index_map_y: first index via ns(), rest in wavefront order
@@ -838,17 +889,18 @@ impl<'a> TileEncoder<'a> {
         // skip = 1 ⇒ read_block_tx_size returns TX_4X4 with no symbols,
         // and residual() codes nothing. Lossless (qindex 0) needs no
         // transform, quantizer, or coefficient syntax at all.
+        Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(mut self) -> io::Result<Vec<u8>> {
         for r in (0..self.mi_rows).step_by(16) {
             for c in (0..self.mi_cols).step_by(16) {
                 // SB roots start with top_has_right set, mirroring the
                 // generated edge-tree root (`top_has_right = 1`).
-                self.partition(r, c, 16, true);
+                self.partition(r, c, 16, true)?;
             }
         }
-        self.sym.finish()
+        Ok(self.sym.finish())
     }
 }
 
@@ -926,10 +978,131 @@ fn sequence_header_obu(w: u32, h: u32) -> Vec<u8> {
     let rem = bits % 8;
     if rem == 0 {
         bytes.push(0x80);
+    } else if let Some(last) = bytes.last_mut() {
+        *last |= 1 << (7 - rem);
     } else {
-        *bytes.last_mut().unwrap() |= 1 << (7 - rem);
+        // Unreachable in practice (header always emits bytes), but avoid
+        // panicking and emit a lone trailing bit instead.
+        bytes.push(0x80);
     }
     bytes
+}
+
+/// AV1 tile limits for `tile_info()` (§6.8, single tile with 64px
+/// superblocks throughout this encoder: `use_128x128_superblock = 0`,
+/// so `sbShift = 4`, `sbSize = 6`).
+const MAX_TILE_WIDTH: u32 = 4096;
+const MAX_TILE_AREA: u32 = 4096 * 2304;
+const MAX_TILE_COLS: u32 = 64;
+const MAX_TILE_ROWS: u32 = 64;
+
+/// `tile_log2(blkSize, target)` (§6.8): smallest `k` with
+/// `(blkSize << k) >= target`.
+fn tile_log2(blk_size: u32, target: u32) -> u32 {
+    let mut k = 0;
+    while ((blk_size as u64) << k) < target as u64 {
+        k += 1;
+    }
+    k
+}
+
+/// Uniform single-tile `tile_info()` parameters for 64px superblocks:
+/// `(minLog2TileCols, maxLog2TileCols, maxLog2TileRows, minLog2Tiles)`.
+/// Callers stay at the minima; single-tile is feasible exactly when
+/// `minLog2TileCols == 0 && minLog2Tiles == 0`.
+fn tile_params(w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let mi_cols = 2 * ((w.saturating_add(7)) >> 3);
+    let mi_rows = 2 * ((h.saturating_add(7)) >> 3);
+    let sb_cols = (mi_cols.saturating_add(15)) >> 4;
+    let sb_rows = (mi_rows.saturating_add(15)) >> 4;
+    // 64px SBs: sbSize = sbShift + 2 = 6.
+    let max_tile_width_sb = MAX_TILE_WIDTH >> 6;
+    let max_tile_area_sb = MAX_TILE_AREA >> 12;
+    let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
+    let max_log2_tile_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
+    let max_log2_tile_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
+    let min_log2_tiles = min_log2_tile_cols
+        .max(tile_log2(max_tile_area_sb, sb_cols.saturating_mul(sb_rows)));
+    (
+        min_log2_tile_cols,
+        max_log2_tile_cols,
+        max_log2_tile_rows,
+        min_log2_tiles,
+    )
+}
+
+/// Dimensions this encoder supports: 16-aligned coding grid, non-empty,
+/// and single-tile feasible with 64px superblocks (i.e. the uniform
+/// `tile_info()` below stays at `TileColsLog2 == TileRowsLog2 == 0`,
+/// so no `context_update_tile_id`/`tile_size_bytes` section exists).
+/// Returns `InvalidInput` otherwise; all public entry points go through
+/// here (via `validate_gray`).
+fn check_supported_dimensions(w: u32, h: u32) -> io::Result<()> {
+    if !(w.is_multiple_of(16) && h.is_multiple_of(16)) {
+        return Err(invalid_input(format!(
+            "dimensions must be 16-aligned, got {w}x{h}"
+        )));
+    }
+    if w == 0 || h == 0 {
+        return Err(invalid_input(format!(
+            "dimensions must be non-empty, got {w}x{h}"
+        )));
+    }
+    let (min_cols, _, _, min_tiles) = tile_params(w, h);
+    if min_cols != 0 || min_tiles != 0 {
+        return Err(invalid_input(format!(
+            "dimensions {w}x{h} need multiple tiles, encoder supports single tile only"
+        )));
+    }
+    Ok(())
+}
+
+/// Supported colors: the palette index CDFs only cover sizes 2..4, so
+/// every 16x16 coding block must hold at most 4 distinct levels (larger
+/// palettes have no index tables). Checked at the boundary before
+/// encoding; `block()` re-checks the palette path it actually codes.
+fn check_supported_colors(gray: &[u8], w: u32, h: u32) -> io::Result<()> {
+    let w_usize = w as usize;
+    let h_usize = h as usize;
+    // `w`/`h` are 16-aligned here (dimensions checked first), so the
+    // 16px grid tiles the raster exactly.
+    for ty in (0..h_usize).step_by(16) {
+        for tx in (0..w_usize).step_by(16) {
+            let mut set = [false; 256];
+            let mut count = 0usize;
+            for y in ty..ty + 16 {
+                for x in tx..tx + 16 {
+                    let v = gray[y * w_usize + x] as usize;
+                    if !set[v] {
+                        set[v] = true;
+                        count += 1;
+                        if count > 4 {
+                            return Err(invalid_input(format!(
+                                "unsupported palette size {count} in 16x16 block at ({tx},{ty}): encoder supports 2..4 colors per block"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Boundary validation for the `io::Result` entry points: dimensions,
+/// checked area, buffer length, and supported colors. Returns
+/// `InvalidInput` instead of panicking.
+fn validate_gray(gray: &[u8], w: u32, h: u32) -> io::Result<usize> {
+    check_supported_dimensions(w, h)?;
+    let area = checked_area(w, h)?;
+    if gray.len() != area {
+        return Err(invalid_input(format!(
+            "pixel buffer length mismatch for {w}x{h}: expected {area} bytes, got {}",
+            gray.len()
+        )));
+    }
+    check_supported_colors(gray, w, h)?;
+    Ok(area)
 }
 
 /// Uncompressed frame header bits for our KEY still, then byte-aligned.
@@ -937,7 +1110,8 @@ fn sequence_header_obu(w: u32, h: u32) -> Vec<u8> {
 /// right here when `allow_screen_content_tools && !superres`); flipping it
 /// changes nothing else (loopfilter/CDEF/restoration sections are already
 /// absent via lossless, delta_q via `base_q_idx == 0`).
-fn frame_header_bits(allow_intrabc: bool) -> Vec<u8> {
+fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>> {
+    check_supported_dimensions(w, h)?;
     let mut bw = BitWriter::new();
     // (show_existing_frame/frame_type/show_frame implied by reduced header)
     bw.put_bit(0); // disable_cdf_update (CDFs adapt)
@@ -950,10 +1124,36 @@ fn frame_header_bits(allow_intrabc: bool) -> Vec<u8> {
     bw.put_bit(u8::from(allow_intrabc));
     // (primary_ref NONE, tile_info, quant, segmentation, deltas,
     //  loopfilter/cdef/lr all implied off by KEY + CodedLossless)
-    // tile_info: uniform spacing, single tile (both increments 0):
+    // tile_info: uniform spacing, single tile. Each increment flag is
+    // only present while its loop has room to increase
+    // (`TileColsLog2 < maxLog2TileCols`, then rows); e.g. a 64x64
+    // frame is a single SB each way, so both loops are empty and no
+    // increment bit exists. Emitting unconditional breaks shifts every
+    // later field and the stream fails to decode.
     bw.put_bit(1); // uniform_tile_spacing_flag
-    bw.put_bit(0); // increment_tile_cols_log2 → break
-    bw.put_bit(0); // increment_tile_rows_log2 → break
+    {
+        let (min_log2_tile_cols, max_log2_tile_cols, max_log2_tile_rows, min_log2_tiles) =
+            tile_params(w, h);
+        // Single tile: stay at the minima (both zero per
+        // `check_supported_dimensions` above).
+        let tile_cols_log2 = min_log2_tile_cols;
+        if tile_cols_log2 < max_log2_tile_cols {
+            bw.put_bit(0); // increment_tile_cols_log2 → break
+        }
+        let min_log2_tile_rows = min_log2_tiles.saturating_sub(tile_cols_log2);
+        let tile_rows_log2 = min_log2_tile_rows;
+        if tile_rows_log2 < max_log2_tile_rows {
+            bw.put_bit(0); // increment_tile_rows_log2 → break
+        }
+        debug_assert!(tile_cols_log2 == 0 && tile_rows_log2 == 0);
+        // (TileColsLog2 == TileRowsLog2 == 0 ⇒ no
+        //  context_update_tile_id / tile_size_bytes_minus_1.)
+        if tile_cols_log2 != 0 || tile_rows_log2 != 0 {
+            return Err(invalid_input(format!(
+                "dimensions {w}x{h} need multiple tiles, encoder supports single tile only"
+            )));
+        }
+    }
     // quantization_params: base_q_idx = 0 (lossless), no deltas, no qmatrix:
     bw.put_bits(0, 8); // base_q_idx
     bw.put_bit(0); // DeltaQYDc.delta_coded
@@ -967,7 +1167,7 @@ fn frame_header_bits(allow_intrabc: bool) -> Vec<u8> {
     bw.put_bit(1); // reduced_tx_set
     // (film_grain: not present ⇒ nothing)
     bw.byte_align();
-    bw.into_bytes()
+    Ok(bw.into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +1177,10 @@ fn frame_header_bits(allow_intrabc: bool) -> Vec<u8> {
 /// Encode one raster to its AV1 item payload (sequence header OBU + frame
 /// OBU wrapping the palette-coded tile data). Returns the payload and the
 /// matching `av1C` body.
-fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> (Vec<u8>, [u8; 4]) {
+///
+/// Validates dimensions, checked area, buffer length, and supported
+/// colors at the boundary, returning `InvalidInput` instead of panicking.
+fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
     encode_obu_payload_with(gray, w, h, USE_INTRABC)
 }
 
@@ -986,15 +1189,14 @@ fn encode_obu_payload_with(
     w: u32,
     h: u32,
     use_intrabc: bool,
-) -> (Vec<u8>, [u8; 4]) {
-    assert_eq!(gray.len(), w as usize * h as usize);
-    assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
+) -> io::Result<(Vec<u8>, [u8; 4])> {
+    validate_gray(gray, w, h)?;
 
-    let tile = TileEncoder::new(gray, w as usize, h as usize, use_intrabc);
-    let tile_data = tile.finish();
+    let tile = TileEncoder::new(gray, w as usize, h as usize, use_intrabc)?;
+    let tile_data = tile.finish()?;
 
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
-    let mut frame_payload = frame_header_bits(use_intrabc);
+    let mut frame_payload = frame_header_bits(w, h, use_intrabc)?;
     // Tile group OBU with a single tile: no header bits, byte-aligned
     // by construction, then the tile data. Together with the frame
     // header this forms an OBU_FRAME (type 6), not OBU_FRAME_HEADER.
@@ -1004,7 +1206,7 @@ fn encode_obu_payload_with(
     payload.extend_from_slice(&frame_obu);
 
     let level_idx = seq_level_idx_for(w, h);
-    (payload, av1c_mono8(level_idx))
+    Ok((payload, av1c_mono8(level_idx)))
 }
 
 fn av01_item(id: u32, w: u32, h: u32, payload: Vec<u8>, av1c: [u8; 4]) -> Item {
@@ -1046,9 +1248,13 @@ fn av01_item(id: u32, w: u32, h: u32, payload: Vec<u8>, av1c: [u8; 4]) -> Item {
 /// complete AVIF file: sequence header OBU + frame OBU (header + single
 /// tile group) wrapping the palette-coded tile data, in a single-`av01`
 /// monochrome primary item.
+///
+/// Supported inputs are 16-aligned non-empty single-tile dimensions with
+/// `gray.len() == w*h` (checked) and at most 4 distinct levels per 16x16
+/// block; violations return `InvalidInput`.
 #[allow(dead_code)]
 pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
-    let (payload, av1c) = encode_obu_payload(gray, w, h);
+    let (payload, av1c) = encode_obu_payload(gray, w, h)?;
 
     let image = IsoBmffImage {
         major_brand: *b"avif",
@@ -1068,6 +1274,9 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
 /// are non-hidden and grouped in an `altr` entity group so readers treat
 /// them as alternatives and display the primary by default (AVIF §5.1).
 /// Each item carries its own `ispe`/`av1C` (levels may differ: 2.0 vs 4.0).
+///
+/// Each raster has the same supported-input constraints as `encode_gray`;
+/// violations return `InvalidInput`.
 pub fn encode_gray_pair(
     small: &[u8],
     sw: u32,
@@ -1076,8 +1285,8 @@ pub fn encode_gray_pair(
     lw: u32,
     lh: u32,
 ) -> io::Result<Vec<u8>> {
-    let (small_payload, small_av1c) = encode_obu_payload(small, sw, sh);
-    let (large_payload, large_av1c) = encode_obu_payload(large, lw, lh);
+    let (small_payload, small_av1c) = encode_obu_payload(small, sw, sh)?;
+    let (large_payload, large_av1c) = encode_obu_payload(large, lw, lh)?;
 
     let image = IsoBmffImage {
         major_brand: *b"avif",
@@ -1125,12 +1334,38 @@ mod tests {
     #[test]
     fn toggle_changes_output_but_stays_valid_obus() {
         let gray = checker(64, 64);
-        let (on, _) = encode_obu_payload_with(&gray, 64, 64, true);
-        let (off, _) = encode_obu_payload_with(&gray, 64, 64, false);
+        let (on, _) = encode_obu_payload_with(&gray, 64, 64, true).unwrap();
+        let (off, _) = encode_obu_payload_with(&gray, 64, 64, false).unwrap();
         // Sequence-header OBU first in both streams.
         assert_eq!(&on[..1], &[0x0a]);
         assert_eq!(&off[..1], &[0x0a]);
         // IntraBC fires on repetitive content, so the streams differ.
         assert_ne!(on, off);
+    }
+
+    #[test]
+    fn invalid_inputs_return_invalid_input() {
+        use std::io::ErrorKind;
+        // Non-16-aligned dimensions.
+        let gray = vec![0u8; 30 * 16];
+        let err = encode_gray(&gray, 30, 16).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Length mismatch (64x64 needs 4096 bytes).
+        let short = vec![0u8; 100];
+        let err = encode_gray(&short, 64, 64).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Too many colors in one 16x16 block (5 distinct levels).
+        let mut many = vec![0u8; 64 * 64];
+        for y in 0..16 {
+            for x in 0..16 {
+                many[y * 64 + x] = (x % 5) as u8;
+            }
+        }
+        let err = encode_gray(&many, 64, 64).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Zero dimensions.
+        let empty: Vec<u8> = vec![];
+        let err = encode_gray(&empty, 0, 0).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }

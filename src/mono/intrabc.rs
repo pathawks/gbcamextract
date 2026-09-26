@@ -120,6 +120,16 @@ const SEARCH_RINGS: i32 = 64;
 /// Pixel-match step: 4px grid keeps every source rect MI-aligned.
 const MATCH_STEP: i32 = 4;
 
+/// AV1 `INTRABC_DELAY_SB64` (terms & definitions): number of 64x64 blocks
+/// before IntraBC can be used. Normative `is_mv_valid` requires
+/// `srcSb64 < activeSb64 - INTRABC_DELAY_SB64` plus the wavefront
+/// inequality below (07.bitstream.semantics §assign-mv-semantics).
+const INTRABC_DELAY_SB64: i64 = 4;
+
+/// `1 + INTRABC_DELAY_SB64 + use_128x128_superblock`; this encoder always
+/// uses 64px superblocks (`use_128x128_superblock = 0`), so the gradient is 5.
+const INTRABC_GRADIENT: i64 = 1 + INTRABC_DELAY_SB64;
+
 pub struct IntrabcState {
     flag: AdaptCdf,
     joint: AdaptCdf,
@@ -462,7 +472,12 @@ impl IntrabcState {
     /// conservative against dav1d's clip/overlap rules: fully above the
     /// current 64px SB row, or same-row slab strictly left of the SB —
     /// both fully decoded — so the decoder's adjustments never trigger
-    /// and erroring overlap is impossible. Returns the MV in 1/8-pel units.
+    /// and erroring overlap is impossible. On top of that, every candidate
+    /// must pass the normative AV1 `is_mv_valid` IntraBC predicates
+    /// (07.bitstream.semantics §assign-mv-semantics): the superblock delay
+    /// `srcSb64 < activeSb64 - INTRABC_DELAY_SB64` and the wavefront
+    /// inequality, computed here for the single-tile, 64px-SB,
+    /// monochrome case. Returns the MV in 1/8-pel units.
     pub fn find_match(
         &self,
         px: &[u8],
@@ -487,6 +502,13 @@ impl IntrabcState {
         if !ok {
             return None;
         }
+        // Normative SB indices for the current block (`is_mv_valid`):
+        // single tile covers the whole frame, 64px SBs throughout.
+        // `totalSb64PerRow = ((MiColEnd - MiColStart - 1) >> 4) + 1`.
+        let total_sb64_per_row = (((self.cols as i32 - 1) >> 4) + 1) as i64;
+        let active_sb_row = (sy / 64) as i64;
+        let active_sb64_col = (sx >> 6) as i64;
+        let active_sb64 = active_sb_row * total_sb64_per_row + active_sb64_col;
         // Residual rings (square, 4px steps): ring 0 is the predictor
         // itself (zero residual, cheapest possible).
         for k in 0..=SEARCH_RINGS {
@@ -522,6 +544,34 @@ impl IntrabcState {
                 let left_slab =
                     y0 >= sby && y0 + hpx <= sby + 64 && x0 + wpx <= sbx;
                 if !(above || left_slab) {
+                    continue;
+                }
+                // Normative `is_mv_valid` IntraBC predicates (single tile,
+                // 64px SBs, monochrome: no chroma edge adjustment, tile clip
+                // already covered by `ok_pos` above).
+                if my.abs() as i64 >= (1 << 14) || mx.abs() as i64 >= (1 << 14) {
+                    continue;
+                }
+                if my % 8 != 0 || mx % 8 != 0 {
+                    continue;
+                }
+                // Source SB is keyed off the bottom-right corner per spec:
+                // `srcSbRow = (srcBottomEdge - 1) / sbH`,
+                // `srcSb64Col = (srcRightEdge - 1) >> 6`.
+                let src_sb_row = ((y0 + hpx - 1) / 64) as i64;
+                let src_sb64_col = ((x0 + wpx - 1) >> 6) as i64;
+                let src_sb64 = src_sb_row * total_sb64_per_row + src_sb64_col;
+                // Delay: `srcSb64 < activeSb64 - INTRABC_DELAY_SB64`.
+                if !(src_sb64 < active_sb64 - INTRABC_DELAY_SB64) {
+                    continue;
+                }
+                // Wavefront: `srcSbRow <= activeSbRow` and
+                // `srcSb64Col < activeSb64Col - DELAY + gradient*(activeRow-srcRow)`.
+                if src_sb_row > active_sb_row {
+                    continue;
+                }
+                let wf_offset = INTRABC_GRADIENT * (active_sb_row - src_sb_row);
+                if !(src_sb64_col < active_sb64_col - INTRABC_DELAY_SB64 + wf_offset) {
                     continue;
                 }
                 if !self.available(x0, y0, wpx, hpx, img_w as i32, img_h as i32) {

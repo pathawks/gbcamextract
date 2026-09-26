@@ -88,7 +88,7 @@ fn get_pic_num_for_slot_num(save: &[u8], slot_num: usize) -> Option<u32> {
         return None;
     }
     let vec_base = 0x11b2usize;
-    let pic_num = save[vec_base + slot_num - 1];
+    let pic_num = *save.get(vec_base + slot_num - 1)?;
     match pic_num {
         0..=29 => Some(pic_num as u32 + 1),
         _ => None,
@@ -254,41 +254,40 @@ fn upscale_nearest(gray: &[u8], w: u32, h: u32, scale: u32) -> Vec<u8> {
     out
 }
 
-fn main() {
-    let args = Args::parse();
-
-    let save = match std::fs::read(&args.save) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("gbcamextract: couldn't open save for reading: {}", e);
-            process::exit(1);
-        }
-    };
+fn run(args: Args) -> Result<(), String> {
+    let save = std::fs::read(&args.save)
+        .map_err(|e| format!("couldn't open save '{}' for reading: {e}", args.save.display()))?;
     if save.len() != SAVE_SIZE {
-        eprintln!("gbcamextract: savegame has weird size");
-        process::exit(1);
+        return Err(format!(
+            "save '{}' has weird size: expected {SAVE_SIZE} bytes, got {}",
+            args.save.display(),
+            save.len()
+        ));
     }
     if is_gb_rom(&save) {
-        eprintln!("gbcamextract: save expected, but rom was given");
-        process::exit(1);
+        return Err(format!(
+            "save '{}': save expected, but rom was given",
+            args.save.display()
+        ));
     }
 
     let rom: Option<Vec<u8>> = match &args.rom {
         Some(path) => {
-            let data = match std::fs::read(path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("gbcamextract: couldn't open rom for reading: {}", e);
-                    process::exit(1);
-                }
-            };
+            let data = std::fs::read(path).map_err(|e| {
+                format!("couldn't open rom '{}' for reading: {e}", path.display())
+            })?;
             if data.len() != ROM_SIZE {
-                eprintln!("gbcamextract: rom has weird size");
-                process::exit(1);
+                return Err(format!(
+                    "rom '{}' has weird size: expected {ROM_SIZE} bytes, got {}",
+                    path.display(),
+                    data.len()
+                ));
             }
             if !is_gb_rom(&data) {
-                eprintln!("gbcamextract: rom given doesn't look like a real rom");
-                process::exit(1);
+                return Err(format!(
+                    "rom '{}' doesn't look like a real rom",
+                    path.display()
+                ));
             }
             Some(data)
         }
@@ -296,10 +295,71 @@ fn main() {
     };
     let rom_ref: Option<&[u8]> = rom.as_deref();
 
+    // Precompute all output filenames before encoding anything. Every
+    // in-range byte in the slot-number table is otherwise trusted as a
+    // unique output number, so two physical slots sharing one metadata
+    // number target the same filename and `std::fs::write` silently
+    // truncates the earlier slot's photo while reporting success.
+    let filenames: Vec<String> = (1..=30usize)
+        .map(|slot_num| match get_pic_num_for_slot_num(&save, slot_num) {
+            Some(n) => format!("IMG_{:02}.avif", n),
+            None => format!("DEL_{:02}.avif", slot_num),
+        })
+        .collect();
+
+    // Intra-run collisions are fatal: damaged or uninitialized metadata
+    // must not lose photos silently. Report every duplicated name with
+    // the slots that share it, then exit before encoding or writing
+    // anything (no partial outputs).
+    {
+        use std::collections::HashMap;
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, name) in filenames.iter().enumerate() {
+            by_name.entry(name.as_str()).or_default().push(idx + 1);
+        }
+        let mut duplicates: Vec<(&str, Vec<usize>)> = by_name
+            .into_iter()
+            .filter(|(_, slots)| slots.len() > 1)
+            .collect();
+        if !duplicates.is_empty() {
+            duplicates.sort_unstable();
+            let mut msg = String::new();
+            for (name, slots) in &duplicates {
+                if !msg.is_empty() {
+                    msg.push_str("; ");
+                }
+                msg.push_str(&format!(
+                    "duplicate output filename {} from slots {}: \
+                     photo numbers in save are not unique; \
+                     refusing to overwrite extracted slots in the same run",
+                    name,
+                    slots
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
+            return Err(msg);
+        }
+    }
+    // Policy for files left over from previous runs: overwrite them in
+    // place via `std::fs::write` below. That is distinct from the
+    // intra-run collision check above, which always fails instead of
+    // overwriting a file written earlier in the same run.
+
     for slot_num in 1..=30usize {
-        let pic_num = get_pic_num_for_slot_num(&save, slot_num);
         let base_address = slot_num_to_base_address(slot_num);
-        let frame_number = save[base_address + 0xfb0] as i32;
+        let frame_number = *save
+            .get(base_address + 0xfb0)
+            .ok_or_else(|| {
+                format!(
+                    "save '{}': slot {slot_num} frame offset {:#x} out of bounds (save len {})",
+                    args.save.display(),
+                    base_address + 0xfb0,
+                    save.len()
+                )
+            })? as i32;
         let frame = rom_ref.map(|r| {
             let (addr, idx) = frame_base_address(r, frame_number);
             FrameInfo {
@@ -315,20 +375,24 @@ fn main() {
 
         let gray = render_photo(rom_tuple, &save, base_address);
         let large = upscale_nearest(&gray, WIDTH, HEIGHT, SCALE);
-        let avif = match mono::encode_gray_pair(&gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("gbcamextract: couldn't encode {}: {}", slot_num, e);
-                process::exit(1);
-            }
-        };
-        let filename = match pic_num {
-            Some(n) => format!("IMG_{:02}.avif", n),
-            None => format!("DEL_{:02}.avif", slot_num),
-        };
-        if let Err(e) = std::fs::write(&filename, &avif) {
-            eprintln!("gbcamextract: couldn't write {}: {}", filename, e);
-            process::exit(1);
-        }
+        let avif = mono::encode_gray_pair(&gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H)
+            .map_err(|e| {
+                format!(
+                    "couldn't encode slot {slot_num} ({}): {e}",
+                    filenames[slot_num - 1]
+                )
+            })?;
+        let filename = &filenames[slot_num - 1];
+        std::fs::write(filename, &avif)
+            .map_err(|e| format!("couldn't write '{filename}': {e}"))?;
+    }
+    Ok(())
+}
+
+fn main() {
+    let args = Args::parse();
+    if let Err(e) = run(args) {
+        eprintln!("gbcamextract: {e}");
+        process::exit(1);
     }
 }
