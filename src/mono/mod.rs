@@ -14,7 +14,9 @@
 //!   IntraBC copy instead: `skip = 1` with an integer motion vector and no
 //!   residuals. The MV predictor replicates dav1d's refmvs search; match
 //!   validity is conservative against the decoder's SB-overlap/tile-clip
-//!   rules, so its adjustments never trigger.
+//!   rules, so its adjustments never trigger. When enabled, each raster is
+//!   encoded both with IntraBC and palette-only and the smaller payload is
+//!   kept; when disabled, only the palette path runs (faster).
 //! * Static default CDFs are the starting point, but every `S()` symbol
 //!   adapts its row (`disable_cdf_update = 0`) except split_or outcomes,
 //!   which dav1d decodes with the non-updating bool reader; no
@@ -39,10 +41,12 @@ use std::io;
 mod intrabc;
 use intrabc::IntrabcState;
 
-/// Code toggle for IntraBC (intra block copy) items: exact pixel-rectangle
-/// copies from causal decoded area via integer MVs + `skip = 1`, as a
-/// per-block alternative to the palette path. `false` restores
-/// byte-identical output to the pre-IntraBC encoder (no flag symbols, no
+/// Code toggle for IntraBC (intra block copy) evaluation: exact
+/// pixel-rectangle copies from causal decoded area via integer MVs +
+/// `skip = 1`, as a per-block alternative to the palette path. When `true`,
+/// each raster is encoded both ways (IntraBC vs palette-only) and the
+/// smaller payload is kept; when `false`, only the palette path is encoded
+/// (faster, byte-identical to the pre-IntraBC encoder: no flag symbols, no
 /// header bit).
 const USE_INTRABC: bool = true;
 
@@ -1178,10 +1182,23 @@ fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>>
 /// OBU wrapping the palette-coded tile data). Returns the payload and the
 /// matching `av1C` body.
 ///
+/// When IntraBC is enabled, the raster is encoded both ways (IntraBC vs
+/// palette-only) and the smaller payload is kept; when disabled, only the
+/// palette path runs (faster).
+///
 /// Validates dimensions, checked area, buffer length, and supported
 /// colors at the boundary, returning `InvalidInput` instead of panicking.
 fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
-    encode_obu_payload_with(gray, w, h, USE_INTRABC)
+    if !USE_INTRABC {
+        return encode_obu_payload_with(gray, w, h, false);
+    }
+    let (on_payload, on_av1c) = encode_obu_payload_with(gray, w, h, true)?;
+    let (off_payload, off_av1c) = encode_obu_payload_with(gray, w, h, false)?;
+    if on_payload.len() <= off_payload.len() {
+        Ok((on_payload, on_av1c))
+    } else {
+        Ok((off_payload, off_av1c))
+    }
 }
 
 fn encode_obu_payload_with(
@@ -1341,6 +1358,27 @@ mod tests {
         assert_eq!(&off[..1], &[0x0a]);
         // IntraBC fires on repetitive content, so the streams differ.
         assert_ne!(on, off);
+    }
+
+    #[test]
+    fn enabled_picks_smallest_payload() {
+        // 8px checker: palette-only wins outright here (IntraBC flags and
+        // finer splits cost more than the copies save); flat rasters tie
+        // (broken toward the IntraBC payload). Either way the enabled
+        // entry point must keep the smaller of the two.
+        let cases: Vec<Vec<u8>> = vec![checker(64, 64), vec![0u8; 64 * 64], vec![85u8; 64 * 64]];
+        for gray in &cases {
+            let (on, _) = encode_obu_payload_with(gray, 64, 64, true).unwrap();
+            let (off, _) = encode_obu_payload_with(gray, 64, 64, false).unwrap();
+            let (picked, _) = encode_obu_payload(gray, 64, 64).unwrap();
+            assert_eq!(picked.len(), on.len().min(off.len()));
+            assert!(picked.len() <= off.len());
+            if on.len() <= off.len() {
+                assert_eq!(picked, on);
+            } else {
+                assert_eq!(picked, off);
+            }
+        }
     }
 
     #[test]
