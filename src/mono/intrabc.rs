@@ -15,7 +15,7 @@
 //! so every source rect stays MI-aligned and the decoded-bitmap check is
 //! exact.
 
-use super::AdaptCdf;
+use super::{adapt_bits, AdaptCdf};
 use gamut_bitstream::SymbolEncoder;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +62,8 @@ const MV_SIGN: [u16; 2] = [16384, 32768];
 // Motion-vector component CDFs (one set per component: 0 = vertical).
 // ---------------------------------------------------------------------------
 
-struct MvComp {
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct MvComp {
     sign: AdaptCdf,
     classes: AdaptCdf,
     class0: AdaptCdf,
@@ -79,22 +80,26 @@ impl MvComp {
         }
     }
 
-    /// Code one nonzero residual component, a multiple of 8 (integer pel
-    /// in 1/8-pel units), mirroring `read_mv_component_diff` with
-    /// mv_prec < 0 (`diff = ((up << 3) | 0b111) + 1`, signed).
-    fn encode(&mut self, sym: &mut SymbolEncoder, d: i32) {
+    /// Cost-aware variant: accumulates `adapt_bits` for every adapting
+    /// symbol (pre-update CDFs) into `cost`, then encodes identically.
+    fn encode_with_cost(&mut self, sym: &mut SymbolEncoder, d: i32, cost: &mut f64) {
         debug_assert!(d != 0 && d % 8 == 0);
         let m = (d.abs() / 8 - 1) as u32;
+        *cost += adapt_bits(&self.sign.cdf, usize::from(d < 0));
         self.sign.encode(sym, usize::from(d < 0));
         let cl = if m == 0 { 0 } else { m.ilog2() };
         debug_assert!(cl <= 10);
+        *cost += adapt_bits(&self.classes.cdf, cl as usize);
         self.classes.encode(sym, cl as usize);
         if cl == 0 {
+            *cost += adapt_bits(&self.class0.cdf, m as usize);
             self.class0.encode(sym, m as usize);
         } else {
             let rem = m - (1 << cl);
             for n in 0..cl {
-                self.classn[n as usize].encode(sym, ((rem >> n) & 1) as usize);
+                let s = ((rem >> n) & 1) as usize;
+                *cost += adapt_bits(&self.classn[n as usize].cdf, s);
+                self.classn[n as usize].encode(sym, s);
             }
         }
     }
@@ -106,8 +111,8 @@ impl MvComp {
 // immediate above/left rows).
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-struct MvRec {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct MvRec {
     intrabc: bool,
     my: i32,
     mx: i32,
@@ -305,11 +310,16 @@ pub struct IntrabcState {
     flag: AdaptCdf,
     joint: AdaptCdf,
     comp: [MvComp; 2],
-    cols: usize,
-    rows: usize,
-    rec: Vec<MvRec>,
-    decoded: Vec<bool>,
+    pub(super) cols: usize,
+    pub(super) rows: usize,
+    pub(super) rec: Vec<MvRec>,
+    pub(super) decoded: Vec<bool>,
     pattern: PatternCache,
+    /// When true, cached-search diagnostics (per-image Cells and process
+    /// globals) are suppressed. RDO trials set this so rejected candidates
+    /// leave no search-cache state changes; the winning re-encode runs with
+    /// false so committed searches are counted exactly once.
+    speculative: bool,
 }
 
 impl IntrabcState {
@@ -330,6 +340,7 @@ impl IntrabcState {
             rec: vec![blank; cols * rows],
             decoded: vec![false; cols * rows],
             pattern: PatternCache::empty(),
+            speculative: false,
         }
     }
 
@@ -451,8 +462,34 @@ impl IntrabcState {
         self.pattern.is_verified()
     }
 
-    pub fn flag(&mut self, sym: &mut SymbolEncoder, use_bc: bool) {
-        self.flag.encode(sym, usize::from(use_bc));
+    /// Cost-aware flag: `adapt_bits` from the pre-update row, then encode.
+    pub fn flag_with_cost(&mut self, sym: &mut SymbolEncoder, use_bc: bool, cost: &mut f64) {
+        let s = usize::from(use_bc);
+        *cost += adapt_bits(&self.flag.cdf, s);
+        self.flag.encode(sym, s);
+    }
+
+    /// Whether speculative trials suppress cached-search diagnostics.
+    pub(super) fn set_speculative(&mut self, v: bool) {
+        self.speculative = v;
+    }
+
+    /// Snapshot the small adapting CDFs plus the speculative flag (not the
+    /// large `rec`/`decoded`/pattern tables, which callers save by footprint).
+    pub(super) fn snapshot_cdfs(&self) -> (AdaptCdf, AdaptCdf, [MvComp; 2], bool) {
+        (
+            self.flag.clone(),
+            self.joint.clone(),
+            self.comp.clone(),
+            self.speculative,
+        )
+    }
+
+    pub(super) fn restore_cdfs(&mut self, saved: (AdaptCdf, AdaptCdf, [MvComp; 2], bool)) {
+        self.flag = saved.0;
+        self.joint = saved.1;
+        self.comp = saved.2;
+        self.speculative = saved.3;
     }
 
     fn at(&self, r: usize, c: usize) -> MvRec {
@@ -707,10 +744,18 @@ impl IntrabcState {
         (fallback, false)
     }
 
-    /// Code the residual `M - P` (both integer-pel, i.e. multiples of 8),
-    /// mirroring `read_mv_residual`: joint symbol selecting nonzero
-    /// components, then one integer-only component diff each.
-    pub fn encode_mvd(&mut self, sym: &mut SymbolEncoder, my: i32, mx: i32, py: i32, px: i32) {
+    /// Cost-aware MVD: joint + per-component diffs, each with `adapt_bits`.
+    /// (The non-cost `encode_mvd` wrapper was removed; all callers use this
+    /// with the live cost accumulator so RDO sees every MV residual bit.)
+    pub fn encode_mvd_with_cost(
+        &mut self,
+        sym: &mut SymbolEncoder,
+        my: i32,
+        mx: i32,
+        py: i32,
+        px: i32,
+        cost: &mut f64,
+    ) {
         let dy = my - py;
         let dx = mx - px;
         debug_assert!(dy % 8 == 0 && dx % 8 == 0);
@@ -720,12 +765,13 @@ impl IntrabcState {
             (true, false) => 2,
             (false, false) => 3,
         };
+        *cost += adapt_bits(&self.joint.cdf, joint);
         self.joint.encode(sym, joint);
         if dy != 0 {
-            self.comp[0].encode(sym, dy);
+            self.comp[0].encode_with_cost(sym, dy, cost);
         }
         if dx != 0 {
-            self.comp[1].encode(sym, dx);
+            self.comp[1].encode_with_cost(sym, dx, cost);
         }
     }
 
@@ -1101,8 +1147,15 @@ impl IntrabcState {
         c: usize,
         top_has_right: bool,
     ) -> CachedDecision {
-        PATTERN_QUERIES.fetch_add(1, Ordering::Relaxed);
-        self.pattern.queries.set(self.pattern.queries.get() + 1);
+        // Speculative RDO trials must leave no search-cache state changes
+        // (rejected candidates restore everything). Suppress both the
+        // process-global atomics and the per-image Cells; the winning
+        // re-encode runs non-speculatively and counts exactly once.
+        let spec = self.speculative;
+        if !spec {
+            PATTERN_QUERIES.fetch_add(1, Ordering::Relaxed);
+            self.pattern.queries.set(self.pattern.queries.get() + 1);
+        }
         let sx = c as i32 * 4;
         let sy = r as i32 * 4;
         let (sbx, sby) = ((c as i32 / 16) * 64, (r as i32 / 16) * 64);
@@ -1121,16 +1174,20 @@ impl IntrabcState {
             level_to_idx(px[(syu + 8) * img_w + sxu]),
             level_to_idx(px[(syu + 8) * img_w + sxu + 8]),
         ) else {
-            PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
+            if !spec {
+                PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
+            }
             return CachedDecision::Fallback;
         };
         // 4px-offset sources can only match stripe queries (see module docs).
         // Fall back narrowly there; uniform defensively falls back too
         // (uniform blocks never reach here via partition/block gating).
         if (a == b && c0 == d) || (a == c0 && b == d) {
-            PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
+            if !spec {
+                PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
+            }
             return CachedDecision::Fallback;
         }
         let key = pack_key(a, b, c0, d);
