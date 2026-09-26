@@ -1,4 +1,5 @@
 use clap::Parser;
+use rayon::prelude::*;
 use std::path::PathBuf;
 use std::process;
 
@@ -348,7 +349,12 @@ fn run(args: Args) -> Result<(), String> {
     // intra-run collision check above, which always fails instead of
     // overwriting a file written earlier in the same run.
 
-    for slot_num in 1..=30usize {
+    // Independent slots are a natural unit of bounded parallel work:
+    // output names are pre-validated unique above, and each iteration
+    // only reads shared inputs (`save`, `rom`) while writing its own
+    // file. Per-photo scratch is bounded after the encoder-side fixes
+    // (no search-ring/index/cache heaps), so peak memory stays flat.
+    (1..31usize).into_par_iter().try_for_each(|slot_num| {
         let base_address = slot_num_to_base_address(slot_num);
         let frame_number = *save
             .get(base_address + 0xfb0)
@@ -385,7 +391,8 @@ fn run(args: Args) -> Result<(), String> {
         let filename = &filenames[slot_num - 1];
         std::fs::write(filename, &avif)
             .map_err(|e| format!("couldn't write '{filename}': {e}"))?;
-    }
+        Ok::<(), String>(())
+    })?;
     Ok(())
 }
 

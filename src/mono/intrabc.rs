@@ -172,9 +172,11 @@ impl IntrabcState {
     /// intrabc neighbours merge into the stack by value (dups bump the
     /// weight, which decides the final order); anything else contributes
     /// nothing. At most 8 entries (later distinct values are dropped).
+    /// Fixed `[((i32,i32),u32); 8]` with explicit `len` — no heap.
     fn consider(
         &self,
-        stack: &mut Vec<((i32, i32), u32)>,
+        stack: &mut [((i32, i32), u32); 8],
+        len: &mut usize,
         r: usize,
         c: usize,
         weight: u32,
@@ -184,10 +186,11 @@ impl IntrabcState {
             return;
         }
         let mv = (rec.my, rec.mx);
-        if let Some(entry) = stack.iter_mut().find(|(m, _)| *m == mv) {
+        if let Some(entry) = stack[..*len].iter_mut().find(|(m, _)| *m == mv) {
             entry.1 += weight;
-        } else if stack.len() < 8 {
-            stack.push((mv, weight));
+        } else if *len < 8 {
+            stack[*len] = (mv, weight);
+            *len += 1;
         }
     }
 
@@ -196,13 +199,14 @@ impl IntrabcState {
     /// contribute nothing, matching the benign padded reads in practice.
     fn consider_opt(
         &self,
-        stack: &mut Vec<((i32, i32), u32)>,
+        stack: &mut [((i32, i32), u32); 8],
+        len: &mut usize,
         r: usize,
         c: usize,
         weight: u32,
     ) {
         if r < self.rows && c < self.cols {
-            self.consider(stack, r, c, weight);
+            self.consider(stack, len, r, c, weight);
         }
     }
 
@@ -210,9 +214,12 @@ impl IntrabcState {
     /// the first neighbour, else a walk stepping by neighbour widths.
     /// Returns dav1d's `n_rows` contribution (`weight >> 1` with
     /// `weight = max(2, min(2*max_rows, first_h))`, else 1 after a walk).
+    /// Fixed stack + explicit length avoids per-call heap.
+    #[allow(clippy::too_many_arguments)]
     fn scan_row_at(
         &self,
-        stack: &mut Vec<((i32, i32), u32)>,
+        stack: &mut [((i32, i32), u32); 8],
+        len: &mut usize,
         r: usize,
         c: usize,
         bw4: usize,
@@ -222,31 +229,34 @@ impl IntrabcState {
     ) -> u32 {
         let first = self.at(r, c);
         if bw4 <= first.bw4 {
-            let len = step.max(bw4.min(first.bw4)) as u32;
+            let len_ = step.max(bw4.min(first.bw4)) as u32;
             let weight = 2.max((2 * max_rows).min(first.bh4 as u32));
-            self.consider(stack, r, c, len * weight);
+            self.consider(stack, len, r, c, len_ * weight);
             return weight >> 1;
         }
-        let mut len = step.max(bw4.min(first.bw4));
+        let mut len_ = step.max(bw4.min(first.bw4));
         let mut x = 0;
         loop {
-            self.consider_opt(stack, r, c + x, (len * 2) as u32);
-            x += len;
+            self.consider_opt(stack, len, r, c + x, (len_ * 2) as u32);
+            x += len_;
             if x >= w4 {
                 break;
             }
             if c + x >= self.cols {
                 break;
             }
-            len = step.max(self.at(r, c + x).bw4);
+            len_ = step.max(self.at(r, c + x).bw4);
         }
         1
     }
 
     /// Mirror of `scan_row_at` down the left column.
+    /// Fixed stack + explicit length avoids per-call heap.
+    #[allow(clippy::too_many_arguments)]
     fn scan_col_at(
         &self,
-        stack: &mut Vec<((i32, i32), u32)>,
+        stack: &mut [((i32, i32), u32); 8],
+        len: &mut usize,
         r: usize,
         c: usize,
         bh4: usize,
@@ -256,23 +266,23 @@ impl IntrabcState {
     ) -> u32 {
         let first = self.at(r, c);
         if bh4 <= first.bh4 {
-            let len = step.max(bh4.min(first.bh4)) as u32;
+            let len_ = step.max(bh4.min(first.bh4)) as u32;
             let weight = 2.max((2 * max_cols).min(first.bw4 as u32));
-            self.consider(stack, r, c, len * weight);
+            self.consider(stack, len, r, c, len_ * weight);
             return weight >> 1;
         }
-        let mut len = step.max(bh4.min(first.bh4));
+        let mut len_ = step.max(bh4.min(first.bh4));
         let mut y = 0;
         loop {
-            self.consider_opt(stack, r + y, c, (len * 2) as u32);
-            y += len;
+            self.consider_opt(stack, len, r + y, c, (len_ * 2) as u32);
+            y += len_;
             if y >= h4 {
                 break;
             }
             if r + y >= self.rows {
                 break;
             }
-            len = step.max(self.at(r + y, c).bh4);
+            len_ = step.max(self.at(r + y, c).bh4);
         }
         1
     }
@@ -316,7 +326,9 @@ impl IntrabcState {
         bh4: usize,
         top_has_right: bool,
     ) -> ((i32, i32), bool) {
-        let mut stack: Vec<((i32, i32), u32)> = Vec::new();
+        let mut entries: [((i32, i32), u32); 8] = [((0, 0), 0); 8];
+        let mut stack_len: usize = 0;
+        let stack: &mut [((i32, i32), u32); 8] = &mut entries;
         let w4 = bw4.min(16).min(self.cols.saturating_sub(c));
         let h4 = bh4.min(16).min(self.rows.saturating_sub(r));
         let mut n_rows: u32 = u32::MAX;
@@ -324,23 +336,23 @@ impl IntrabcState {
         if r > 0 {
             max_rows = (((r + 1) >> 1).min(3)) as u32;
             let step = if bw4 >= 16 { 4 } else { 1 };
-            n_rows = self.scan_row_at(&mut stack, r - 1, c, bw4, w4, max_rows, step);
+            n_rows = self.scan_row_at(stack, &mut stack_len, r - 1, c, bw4, w4, max_rows, step);
         }
         let mut n_cols: u32 = u32::MAX;
         let mut max_cols: u32 = 0;
         if c > 0 {
             max_cols = (((c + 1) >> 1).min(3)) as u32;
             let step = if bh4 >= 16 { 4 } else { 1 };
-            n_cols = self.scan_col_at(&mut stack, r, c - 1, bh4, h4, max_cols, step);
+            n_cols = self.scan_col_at(stack, &mut stack_len, r, c - 1, bh4, h4, max_cols, step);
         }
         if r > 0 && top_has_right && bw4.max(bh4) <= 16 && c + bw4 < self.cols {
-            self.consider(&mut stack, r - 1, c + bw4, 4);
+            self.consider(stack, &mut stack_len, r - 1, c + bw4, 4);
         }
-        let nearest_cnt = stack.len();
+        let nearest_cnt = stack_len;
         // Top-left corner cell (`b_top[-1]`): only when some primary scan
         // ran (else dav1d's pointer is uninitialized) and fully in-frame.
         if (n_rows | n_cols) != u32::MAX && r > 0 && c > 0 {
-            self.consider(&mut stack, r - 1, c - 1, 4);
+            self.consider(stack, &mut stack_len, r - 1, c - 1, 4);
         }
         // Secondary 8x8-resolution rows/columns.
         for n in 2u32..=3 {
@@ -348,7 +360,8 @@ impl IntrabcState {
                 let rr = ((r as i32 - 2 * n as i32 + 1) | 1).max(0) as usize;
                 let cc = (c as i32 | 1).max(0) as usize;
                 n_rows += self.scan_row_at(
-                    &mut stack,
+                    stack,
+                    &mut stack_len,
                     rr,
                     cc,
                     bw4,
@@ -361,7 +374,8 @@ impl IntrabcState {
                 let rr = (r as i32 | 1).max(0) as usize;
                 let cc = ((c as i32 - 2 * n as i32 + 1) | 1).max(0) as usize;
                 n_cols += self.scan_col_at(
-                    &mut stack,
+                    stack,
+                    &mut stack_len,
                     rr,
                     cc,
                     bh4,
@@ -373,11 +387,14 @@ impl IntrabcState {
         }
         // dav1d's two bubble sorts: [0, nearest_cnt), then the tail.
         // Only relative order within each region matters for entry 0.
-        let split = nearest_cnt.min(stack.len());
-        let total = stack.len();
-        Self::sort_region(&mut stack, 0, split);
-        Self::sort_region(&mut stack, split, total);
-        let first = stack.first().map(|(m, _)| *m).unwrap_or((0, 0));
+        let split = nearest_cnt.min(stack_len);
+        let total = stack_len;
+        Self::sort_region(&mut stack[..stack_len], 0, split);
+        Self::sort_region(&mut stack[..stack_len], split, total);
+        let first = stack[..stack_len]
+            .first()
+            .map(|(m, _)| *m)
+            .unwrap_or((0, 0));
         if first != (0, 0) {
             return (first, true);
         }
@@ -393,7 +410,7 @@ impl IntrabcState {
         } else {
             (-512, 0)
         };
-        if stack.is_empty() {
+        if stack_len == 0 {
             return (fallback, true);
         }
         (fallback, false)
@@ -477,7 +494,8 @@ impl IntrabcState {
     /// (07.bitstream.semantics §assign-mv-semantics): the superblock delay
     /// `srcSb64 < activeSb64 - INTRABC_DELAY_SB64` and the wavefront
     /// inequality, computed here for the single-tile, 64px-SB,
-    /// monochrome case. Returns the MV in 1/8-pel units.
+    /// monochrome case. Returns the MV in 1/8-pel units plus the predictor
+    /// it was found from (so callers avoid a second `predictor` query).
     pub fn find_match(
         &self,
         px: &[u8],
@@ -488,13 +506,10 @@ impl IntrabcState {
         bw4: usize,
         bh4: usize,
         top_has_right: bool,
-    ) -> Option<(i32, i32)> {
+    ) -> Option<((i32, i32), (i32, i32))> {
         let (wpx, hpx) = (bw4 as i32 * 4, bh4 as i32 * 4);
         let (sx, sy) = (c as i32 * 4, r as i32 * 4);
-        let (sbx, sby) = (
-            (c as i32 / 16) * 64,
-            (r as i32 / 16) * 64,
-        );
+        let (sbx, sby) = ((c as i32 / 16) * 64, (r as i32 / 16) * 64);
         // Gate: without a usable replicated entry 0 the decoder would
         // draw on the unreplicated tail (corner-garbage/secondary rows),
         // so fall back to palette instead of risking divergence.
@@ -502,6 +517,7 @@ impl IntrabcState {
         if !ok {
             return None;
         }
+        let pred = (py, px_);
         // Normative SB indices for the current block (`is_mv_valid`):
         // single tile covers the whole frame, 64px SBs throughout.
         // `totalSb64PerRow = ((MiColEnd - MiColStart - 1) >> 4) + 1`.
@@ -509,78 +525,200 @@ impl IntrabcState {
         let active_sb_row = (sy / 64) as i64;
         let active_sb64_col = (sx >> 6) as i64;
         let active_sb64 = active_sb_row * total_sb64_per_row + active_sb64_col;
+        // Block fingerprint: 5 sampled pixels (corners + centre) of the
+        // current block, computed once. Per-candidate fingerprint rejects
+        // mismatches with 5 loads before the decoded-bitmap scan and the
+        // full pixel compare; a fingerprint hit still verifies full pixel
+        // equality via `matches`, so selection is exact.
+        let sxu = sx as usize;
+        let syu = sy as usize;
+        let wpxu = wpx as usize;
+        let hpxu = hpx as usize;
+        let cur_fp: [u8; 5] = [
+            px[syu * img_w + sxu],
+            px[syu * img_w + sxu + wpxu - 1],
+            px[(syu + hpxu - 1) * img_w + sxu],
+            px[(syu + hpxu - 1) * img_w + sxu + wpxu - 1],
+            px[(syu + hpxu / 2) * img_w + sxu + wpxu / 2],
+        ];
         // Residual rings (square, 4px steps): ring 0 is the predictor
-        // itself (zero residual, cheapest possible).
+        // itself (zero residual, cheapest possible). Coordinates are
+        // evaluated directly in spiral order — no temporary `Vec`.
+        // Identical order to the previous ring-buffer version.
         for k in 0..=SEARCH_RINGS {
-            let mut ring: Vec<(i32, i32)> = Vec::new();
             if k == 0 {
-                ring.push((0, 0));
-            } else {
-                let s = k * MATCH_STEP;
-                for i in -k..=k {
-                    ring.push((i * MATCH_STEP, -s));
-                    ring.push((i * MATCH_STEP, s));
-                    if i != -k && i != k {
-                        ring.push((-s, i * MATCH_STEP));
-                        ring.push((s, i * MATCH_STEP));
+                if let Some(mv) = self.probe_candidate(
+                    px,
+                    img_w,
+                    img_h,
+                    sx,
+                    sy,
+                    wpx,
+                    hpx,
+                    sbx,
+                    sby,
+                    total_sb64_per_row,
+                    active_sb_row,
+                    active_sb64,
+                    active_sb64_col,
+                    cur_fp,
+                    py,
+                    px_,
+                ) {
+                    return Some((mv, pred));
+                }
+                continue;
+            }
+            let s = k * MATCH_STEP;
+            for i in -k..=k {
+                let o = i * MATCH_STEP;
+                // Top edge (y = -s), then bottom edge (y = +s).
+                for &(rdx, rdy) in &[(o, -s), (o, s)] {
+                    let my = py + rdy * 8;
+                    let mx = px_ + rdx * 8;
+                    if let Some(mv) = self.probe_candidate_at(
+                        px, img_w, img_h, sx, sy, wpx, hpx, sbx, sby,
+                        total_sb64_per_row, active_sb_row, active_sb64,
+                        active_sb64_col, cur_fp, my, mx,
+                    ) {
+                        return Some((mv, pred));
+                    }
+                }
+                // Side edges (x = ±s), interior rows only.
+                if i != -k && i != k {
+                    for &(rdx, rdy) in &[(-s, o), (s, o)] {
+                        let my = py + rdy * 8;
+                        let mx = px_ + rdx * 8;
+                        if let Some(mv) = self.probe_candidate_at(
+                            px, img_w, img_h, sx, sy, wpx, hpx, sbx, sby,
+                            total_sb64_per_row, active_sb_row, active_sb64,
+                            active_sb64_col, cur_fp, my, mx,
+                        ) {
+                            return Some((mv, pred));
+                        }
                     }
                 }
             }
-            for (rdx, rdy) in ring {
-                // Decoder convention (dav1d): source = current + MV,
-                // so MV = source - current, in 1/8-pel units.
-                let my = py + rdy * 8;
-                let mx = px_ + rdx * 8;
-                let x0 = sx + mx / 8;
-                let y0 = sy + my / 8;
-                let ok_pos = x0 >= 0
-                    && y0 >= 0
-                    && x0 + wpx <= img_w as i32
-                    && y0 + hpx <= img_h as i32;
-                if !ok_pos {
-                    continue;
-                }
-                let above = y0 + hpx <= sby;
-                let left_slab =
-                    y0 >= sby && y0 + hpx <= sby + 64 && x0 + wpx <= sbx;
-                if !(above || left_slab) {
-                    continue;
-                }
-                // Normative `is_mv_valid` IntraBC predicates (single tile,
-                // 64px SBs, monochrome: no chroma edge adjustment, tile clip
-                // already covered by `ok_pos` above).
-                if my.abs() as i64 >= (1 << 14) || mx.abs() as i64 >= (1 << 14) {
-                    continue;
-                }
-                if my % 8 != 0 || mx % 8 != 0 {
-                    continue;
-                }
-                // Source SB is keyed off the bottom-right corner per spec:
-                // `srcSbRow = (srcBottomEdge - 1) / sbH`,
-                // `srcSb64Col = (srcRightEdge - 1) >> 6`.
-                let src_sb_row = ((y0 + hpx - 1) / 64) as i64;
-                let src_sb64_col = ((x0 + wpx - 1) >> 6) as i64;
-                let src_sb64 = src_sb_row * total_sb64_per_row + src_sb64_col;
-                // Delay: `srcSb64 < activeSb64 - INTRABC_DELAY_SB64`.
-                if !(src_sb64 < active_sb64 - INTRABC_DELAY_SB64) {
-                    continue;
-                }
-                // Wavefront: `srcSbRow <= activeSbRow` and
-                // `srcSb64Col < activeSb64Col - DELAY + gradient*(activeRow-srcRow)`.
-                if src_sb_row > active_sb_row {
-                    continue;
-                }
-                let wf_offset = INTRABC_GRADIENT * (active_sb_row - src_sb_row);
-                if !(src_sb64_col < active_sb64_col - INTRABC_DELAY_SB64 + wf_offset) {
-                    continue;
-                }
-                if !self.available(x0, y0, wpx, hpx, img_w as i32, img_h as i32) {
-                    continue;
-                }
-                if self.matches(px, img_w, sx, sy, x0, y0, wpx, hpx) {
-                    return Some((my, mx));
-                }
-            }
+        }
+        None
+    }
+
+    /// Probe the predictor itself (ring 0, zero residual). Thin wrapper
+    /// over `probe_candidate_at` for the `k == 0` case.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn probe_candidate(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        sx: i32,
+        sy: i32,
+        wpx: i32,
+        hpx: i32,
+        sbx: i32,
+        sby: i32,
+        total_sb64_per_row: i64,
+        active_sb_row: i64,
+        active_sb64: i64,
+        active_sb64_col: i64,
+        cur_fp: [u8; 5],
+        py: i32,
+        px_: i32,
+    ) -> Option<(i32, i32)> {
+        self.probe_candidate_at(
+            px, img_w, img_h, sx, sy, wpx, hpx, sbx, sby,
+            total_sb64_per_row, active_sb_row, active_sb64,
+            active_sb64_col, cur_fp, py, px_,
+        )
+    }
+
+    /// Validate one candidate MV against all normative/conservative bounds,
+    /// then fingerprint, decoded bitmap, and full pixel equality.
+    /// Returns `Some((my, mx))` on an exact match, else `None`.
+    /// Check order is cheapest-first: position bounds, MV range/alignment,
+    /// normative SB delay + wavefront, conservative SB overlap, 5-pixel
+    /// fingerprint, decoded bitmap, full `matches`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn probe_candidate_at(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        sx: i32,
+        sy: i32,
+        wpx: i32,
+        hpx: i32,
+        sbx: i32,
+        sby: i32,
+        total_sb64_per_row: i64,
+        active_sb_row: i64,
+        active_sb64: i64,
+        active_sb64_col: i64,
+        cur_fp: [u8; 5],
+        my: i32,
+        mx: i32,
+    ) -> Option<(i32, i32)> {
+        // Decoder convention (dav1d): source = current + MV,
+        // so MV = source - current, in 1/8-pel units.
+        let x0 = sx + mx / 8;
+        let y0 = sy + my / 8;
+        if x0 < 0 || y0 < 0 || x0 + wpx > img_w as i32 || y0 + hpx > img_h as i32 {
+            return None;
+        }
+        // Normative `is_mv_valid` IntraBC predicates (single tile,
+        // 64px SBs, monochrome: no chroma edge adjustment, tile clip
+        // already covered by the bounds above).
+        if my.abs() as i64 >= (1 << 14) || mx.abs() as i64 >= (1 << 14) {
+            return None;
+        }
+        if my % 8 != 0 || mx % 8 != 0 {
+            return None;
+        }
+        // Source SB is keyed off the bottom-right corner per spec:
+        // `srcSbRow = (srcBottomEdge - 1) / sbH`,
+        // `srcSb64Col = (srcRightEdge - 1) >> 6`.
+        let src_sb_row = ((y0 + hpx - 1) / 64) as i64;
+        let src_sb64_col = ((x0 + wpx - 1) >> 6) as i64;
+        let src_sb64 = src_sb_row * total_sb64_per_row + src_sb64_col;
+        // Delay: `srcSb64 < activeSb64 - INTRABC_DELAY_SB64`.
+        if !(src_sb64 < active_sb64 - INTRABC_DELAY_SB64) {
+            return None;
+        }
+        // Wavefront: `srcSbRow <= activeSbRow` and
+        // `srcSb64Col < activeSb64Col - DELAY + gradient*(activeRow-srcRow)`.
+        if src_sb_row > active_sb_row {
+            return None;
+        }
+        let wf_offset = INTRABC_GRADIENT * (active_sb_row - src_sb_row);
+        if !(src_sb64_col < active_sb64_col - INTRABC_DELAY_SB64 + wf_offset) {
+            return None;
+        }
+        // Conservative decoder SB-overlap guard.
+        let above = y0 + hpx <= sby;
+        let left_slab = y0 >= sby && y0 + hpx <= sby + 64 && x0 + wpx <= sbx;
+        if !(above || left_slab) {
+            return None;
+        }
+        // 5-pixel fingerprint before the bitmap scan.
+        let x0u = x0 as usize;
+        let y0u = y0 as usize;
+        let wpxu = wpx as usize;
+        let hpxu = hpx as usize;
+        if px[y0u * img_w + x0u] != cur_fp[0]
+            || px[y0u * img_w + x0u + wpxu - 1] != cur_fp[1]
+            || px[(y0u + hpxu - 1) * img_w + x0u] != cur_fp[2]
+            || px[(y0u + hpxu - 1) * img_w + x0u + wpxu - 1] != cur_fp[3]
+            || px[(y0u + hpxu / 2) * img_w + x0u + wpxu / 2] != cur_fp[4]
+        {
+            return None;
+        }
+        if !self.available(x0, y0, wpx, hpx, img_w as i32, img_h as i32) {
+            return None;
+        }
+        if self.matches(px, img_w, sx, sy, x0, y0, wpx, hpx) {
+            return Some((my, mx));
         }
         None
     }

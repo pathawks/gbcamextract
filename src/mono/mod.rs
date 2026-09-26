@@ -363,7 +363,6 @@ struct TileEncoder<'a> {
     /// `None` disables IntraBC entirely (byte-identical to the pre-IntraBC
     /// encoder: no flag symbols, no header bit — see `USE_INTRABC`).
     intrabc: Option<IntrabcState>,
-    ymode: Vec<u8>,
     skip: Vec<u8>,
     psize: Vec<u8>,
     pcolors: Vec<[u8; 8]>,
@@ -400,7 +399,6 @@ impl<'a> TileEncoder<'a> {
             sym: SymbolEncoder::new(),
             cdfs: Cdfs::new(),
             intrabc: use_intrabc.then(|| IntrabcState::new(mi_cols, mi_rows)),
-            ymode: vec![0; mi_area],
             skip: vec![0; mi_area],
             psize: vec![0; mi_area],
             pcolors: vec![[0u8; 8]; mi_area],
@@ -498,7 +496,7 @@ impl<'a> TileEncoder<'a> {
             let ctx = self.partition_ctx(r, c, bsl);
             self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
-            self.block(r, c, bsl, top_has_right)?;
+            self.block(r, c, bsl, top_has_right, None)?;
             return Ok(());
         }
         // Contained nodes: flat regions always take NONE (palette beats a
@@ -507,20 +505,29 @@ impl<'a> TileEncoder<'a> {
         // 2..=4-level region takes NONE only when a copy exists now —
         // otherwise it splits so children can match at finer grain.
         // Partially on-screen nodes never take NONE (edge path below).
+        // The successful search (MV + predictor) is carried into `block`
+        // to avoid repeating the same search and predictor query.
         if r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols {
             let levels = self.region_levels(r, c, bw4);
+            let carried: Option<((i32, i32), (i32, i32))> = if levels <= 1
+                || self.intrabc.is_none()
+            {
+                None
+            } else {
+                self.intrabc_match(r, c, bw4, top_has_right)
+            };
             let take_none = if levels <= 1 {
                 true
             } else if self.intrabc.is_none() {
                 levels <= 4
             } else {
-                self.intrabc_match(r, c, bw4, top_has_right).is_some()
+                carried.is_some()
             };
             if take_none {
                 let ctx = self.partition_ctx(r, c, bsl);
                 self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
                 self.update_partition_ctx(r, c, bsl);
-                self.block(r, c, bsl, top_has_right)?;
+                self.block(r, c, bsl, top_has_right, carried)?;
                 return Ok(());
             }
         }
@@ -582,14 +589,15 @@ impl<'a> TileEncoder<'a> {
     /// IntraBC copy available for the `bw4`-MI square at MI `(r, c)` right
     /// now (deterministic in decoder state, so `partition()` and `block()`
     /// agree): the decoder-predictor-rooted match search, or `None` when
-    /// disabled. Returns the MV in 1/8-pel units.
+    /// disabled. Returns the MV in 1/8-pel units plus the predictor it was
+    /// found from (so `block` avoids a second `predictor` query).
     fn intrabc_match(
         &self,
         r: usize,
         c: usize,
         bw4: usize,
         top_has_right: bool,
-    ) -> Option<(i32, i32)> {
+    ) -> Option<((i32, i32), (i32, i32))> {
         match self.intrabc.as_ref() {
             Some(bc) => bc.find_match(self.px, self.w, self.h, r, c, bw4, bw4, top_has_right),
             None => None,
@@ -598,7 +606,8 @@ impl<'a> TileEncoder<'a> {
 
     /// `get_palette_cache` for luma: sorted dedup merge of the above
     /// (unless at a 64px superblock-row top) and left palettes.
-    fn palette_cache(&self, r: usize, c: usize) -> Vec<u8> {
+    /// Fixed `[u8; 8]` + length — at most 4+4 entries, no heap.
+    fn palette_cache(&self, r: usize, c: usize) -> ([u8; 8], usize) {
         let above_n = if !r.is_multiple_of(16) {
             self.psize[(r - 1) * self.mi_cols + c] as usize
         } else {
@@ -620,20 +629,25 @@ impl<'a> TileEncoder<'a> {
         } else {
             &blank
         };
-        let mut cache = Vec::new();
-        let mut push = |v: u8| {
-            if cache.last() != Some(&v) {
-                cache.push(v);
+        let mut cache = [0u8; 8];
+        let mut cache_len: usize = 0;
+        let push = |v: u8, cache: &mut [u8; 8], cache_len: &mut usize| {
+            if *cache_len == 0 || cache[*cache_len - 1] != v {
+                debug_assert!(*cache_len < 8);
+                if *cache_len < 8 {
+                    cache[*cache_len] = v;
+                    *cache_len += 1;
+                }
             }
         };
         let (mut ai, mut li) = (0, 0);
         while ai < above_n && li < left_n {
             let (ac, lc) = (above[ai], left[li]);
             if lc < ac {
-                push(lc);
+                push(lc, &mut cache, &mut cache_len);
                 li += 1;
             } else {
-                push(ac);
+                push(ac, &mut cache, &mut cache_len);
                 ai += 1;
                 if lc == ac {
                     li += 1;
@@ -641,14 +655,14 @@ impl<'a> TileEncoder<'a> {
             }
         }
         while ai < above_n {
-            push(above[ai]);
+            push(above[ai], &mut cache, &mut cache_len);
             ai += 1;
         }
         while li < left_n {
-            push(left[li]);
+            push(left[li], &mut cache, &mut cache_len);
             li += 1;
         }
-        cache
+        (cache, cache_len)
     }
 
     /// `ns(n)` literal (§4.10.7).
@@ -674,20 +688,37 @@ impl<'a> TileEncoder<'a> {
     /// legal at all three sizes (dav1d gates it on `imax(bw4, bh4) <= 16`
     /// MI); the index tables only cover sizes 2..4, so the palette path
     /// returns `InvalidInput` for any other distinct count.
+    ///
+    /// `carried` is the successful `partition` search (MV + predictor) for
+    /// this exact block, avoiding a repeated `find_match` and a repeated
+    /// `predictor` query. `None` means "decide here" (leaves, flat blocks,
+    /// IntraBC off, or no match at the parent).
     fn block(
         &mut self,
         r: usize,
         c: usize,
         bsl: usize,
         top_has_right: bool,
+        carried: Option<((i32, i32), (i32, i32))>,
     ) -> io::Result<()> {
         let bw: usize = 4 << bsl;
         let (sx, sy) = (c * 4, r * 4);
         let bw4 = 1usize << bsl;
 
-        // Palette colors first: the distinct count doubles as the flat
-        // test (single-level blocks always take the palette path — a copy
-        // can't beat a ~15-bit flat table).
+        // Fast path: `partition` already found an exact copy for this
+        // block. Skip distinct/colors/cache work entirely — a copy beats
+        // the palette path by construction here.
+        if let Some(((my, mx), (py, px_))) = carried {
+            let sctx = self.skip_ctx(r, c);
+            self.cdfs.skip[sctx].encode(&mut self.sym, 1);
+            self.encode_copy(r, c, bsl, bw4, my, mx, py, px_)?;
+            return Ok(());
+        }
+
+        // Distinct-level scan doubles as the flat test (single-level
+        // blocks always take the palette path — a copy can't beat a
+        // ~15-bit flat table). The `set` is reused below to build the
+        // palette colors, so this scan is not wasted on the palette path.
         let mut set = [false; 256];
         for i in 0..bw {
             for j in 0..bw {
@@ -695,34 +726,17 @@ impl<'a> TileEncoder<'a> {
             }
         }
         let distinct = set.iter().filter(|&&b| b).count();
-        let mut colors: Vec<u8> = (0..256).filter(|&v| set[v]).map(|v| v as u8).collect();
-        if colors.is_empty() {
+        if distinct == 0 {
             return Err(invalid_input(format!(
                 "empty palette block at MI ({r},{c}) size {bw}x{bw}"
             )));
         }
-        // A flat block still needs a 2-entry table. Prefer padding with a
-        // cached level (nearly free via a reuse flag below) over an
-        // adjacent level (short delta chain); either way the pad value is
-        // never referenced by the index map.
-        let cache = self.palette_cache(r, c);
-        if colors.len() == 1 {
-            let v = colors[0];
-            let pad = cache
-                .iter()
-                .find(|&&cc| cc != v)
-                .copied()
-                .unwrap_or(if v < 255 { v + 1 } else { v - 1 });
-            colors.push(pad);
-            colors.sort_unstable();
-        }
-        let psize = colors.len();
 
         // IntraBC decision (non-flat only): an exact match in causal
         // decoded area beats the palette path (MV residual of ~10-25 bits
-        // vs palette headers plus indices). Deterministic, so it agrees
-        // with `partition()`'s NONE-vs-SPLIT check above.
-        let bc_mv: Option<(i32, i32)> = if distinct > 1 {
+        // vs palette headers plus indices). `find_match` returns the
+        // predictor too, so no second `predictor` query is needed.
+        let bc_match: Option<((i32, i32), (i32, i32))> = if distinct > 1 {
             self.intrabc_match(r, c, bw4, top_has_right)
         } else {
             None
@@ -733,53 +747,101 @@ impl<'a> TileEncoder<'a> {
         let sctx = self.skip_ctx(r, c);
         self.cdfs.skip[sctx].encode(&mut self.sym, 1);
 
-        if let Some((my, mx)) = bc_mv {
-            // IntraBC copy: flag, then the MV residual against the
-            // decoder's predictor (replicated refmvs search). No mode,
-            // palette, or index symbols; dav1d records DC/empty palette
-            // contexts for neighbours, mirrored in bookkeeping below.
-            let Some(bc) = self.intrabc.as_mut() else {
-                return Err(io::Error::other(
-                    "internal: IntraBC match without IntraBC state",
-                ));
-            };
-            bc.flag(&mut self.sym, true);
-            let ((py, px_), _) = bc.predictor(r, c, bw4, bw4, top_has_right);
-            bc.encode_mvd(&mut self.sym, my, mx, py, px_);
-            let n4 = 1usize << bsl;
-            for y in 0..n4 {
-                for x in 0..n4 {
-                    let (rr, cc) = (r + y, c + x);
-                    self.ymode[rr * self.mi_cols + cc] = DC_PRED as u8;
-                    self.skip[rr * self.mi_cols + cc] = 1;
-                    self.psize[rr * self.mi_cols + cc] = 0;
-                }
-            }
-            self.intrabc
-                .as_mut()
-                .ok_or_else(|| io::Error::other("internal: missing IntraBC state"))?
-                .record(r, c, bw4, bw4, Some((my, mx)));
+        if let Some(((my, mx), (py, px_))) = bc_match {
+            self.encode_copy(r, c, bsl, bw4, my, mx, py, px_)?;
             return Ok(());
         }
-        // Palette path: the index CDFs only support 2..4 colors.
-        if !(2..=4).contains(&psize) {
+        // Palette path from here: build colors/cache/index scratch only
+        // now that the copy path is ruled out.
+        let mut colors = [0u8; 4];
+        let mut psize: usize = 0;
+        for (v, &present) in set.iter().enumerate() {
+            if present {
+                if psize < 4 {
+                    colors[psize] = v as u8;
+                    psize += 1;
+                } else {
+                    // More than 4 distinct: palette path is unsupported
+                    // (no index tables). Count for the error below.
+                    psize = distinct;
+                    break;
+                }
+            }
+        }
+        // `distinct` is authoritative; `psize` above is `min(distinct,4)`
+        // unless overflow. Re-derive for the flat-pad and error paths.
+        let mut n_colors = distinct;
+        if distinct <= 4 {
+            debug_assert_eq!(psize, distinct);
+        } else {
+            // Palette path: the index CDFs only support 2..4 colors.
             return Err(invalid_input(format!(
-                "unsupported palette size {psize} in {bw}x{bw} block at ({sx},{sy}): encoder supports 2..4 colors per palette-coded block"
+                "unsupported palette size {distinct} in {bw}x{bw} block at ({sx},{sy}): encoder supports 2..4 colors per palette-coded block"
             )));
         }
+        // A flat block still needs a 2-entry table. Prefer padding with a
+        // cached level (nearly free via a reuse flag below) over an
+        // adjacent level (short delta chain); either way the pad value is
+        // never referenced by the index map.
+        let (cache_arr, cache_len) = self.palette_cache(r, c);
+        if n_colors == 1 {
+            let v = colors[0];
+            let mut pad: Option<u8> = None;
+            for &cc in &cache_arr[..cache_len] {
+                if cc != v {
+                    pad = Some(cc);
+                    break;
+                }
+            }
+            let pad = pad.unwrap_or(if v < 255 { v + 1 } else { v - 1 });
+            colors[1] = pad;
+            n_colors = 2;
+            // Keep the 2-entry table sorted (binary_search below).
+            if colors[0] > colors[1] {
+                colors.swap(0, 1);
+            }
+        }
+        let psize = n_colors;
+
+        // Palette path from here: build colors/cache/index scratch only
+        // now that the copy path is ruled out.
+        // (colors/cache/index construction delayed until the palette
+        // branch actually needs it — copy blocks skip all of it.)
         if let Some(bc) = &mut self.intrabc {
             bc.flag(&mut self.sym, false);
         }
 
-        let mut index_map = vec![0u8; bw * bw];
+        let colors_slice = &colors[..psize];
+        // Reusable index-map scratch: 64x64 max = 4096 bytes on the stack,
+        // no per-block heap. Only the first `bw*bw` entries are used.
+        let mut index_map = [0u8; 4096];
+        let area = bw * bw;
+        debug_assert!(area <= 4096);
+        // Copy px/w out to avoid `&mut self` / `&self` borrow conflicts
+        // with the local scratch (disjoint-field friendly).
+        let px_ref = self.px;
+        let w_ref = self.w;
         for i in 0..bw {
+            let row_off = (sy + i) * w_ref + sx;
             for j in 0..bw {
-                let v = self.sample(sx + j, sy + i);
-                index_map[i * bw + j] = colors.binary_search(&v).unwrap_or(0) as u8;
+                let v = px_ref[row_off + j];
+                // `colors_slice` is sorted; linear scan over ≤4 entries
+                // is cheaper than `binary_search` setup.
+                let mut idx = 0u8;
+                for (k, &cc) in colors_slice.iter().enumerate() {
+                    if cc == v {
+                        idx = k as u8;
+                        break;
+                    }
+                }
+                index_map[i * bw + j] = idx;
             }
         }
+        let index_slice = &index_map[..area];
 
         // y_mode = DC_PRED (all neighbours are DC, so contexts are row 0).
+        // (No `ymode` grid: the all-DC invariant is explicit — neighbours
+        // are always DC on both paths, so nothing reads it back.)
         self.cdfs.y_dc.encode(&mut self.sym, DC_PRED);
 
         // has_palette_y = 1 (context = neighbours paletted; CDF row
@@ -799,13 +861,13 @@ impl<'a> TileEncoder<'a> {
         // 4 gray levels exist globally, so the cache almost always covers
         // the block — this is where the upscale's bits were going.
         self.cdfs.pal_size[bsl - 2].encode(&mut self.sym, psize - 2);
-        let mut is_used = vec![false; psize];
+        let mut is_used = [false; 4];
         let mut n_used = 0usize;
-        for &cc in &cache {
+        for &cc in &cache_arr[..cache_len] {
             if n_used == psize {
                 break;
             }
-            if let Ok(pos) = colors.binary_search(&cc) {
+            if let Ok(pos) = colors_slice.binary_search(&cc) {
                 self.sym.encode_literal(1, 1);
                 is_used[pos] = true;
                 n_used += 1;
@@ -813,21 +875,24 @@ impl<'a> TileEncoder<'a> {
                 self.sym.encode_literal(0, 1);
             }
         }
-        let new_colors: Vec<u8> = colors
-            .iter()
-            .zip(is_used.iter())
-            .filter(|(_, &u)| !u)
-            .map(|(&c, _)| c)
-            .collect();
+        let mut new_colors = [0u8; 4];
+        let mut new_len: usize = 0;
+        for (k, &cc) in colors_slice.iter().enumerate() {
+            if !is_used[k] {
+                new_colors[new_len] = cc;
+                new_len += 1;
+            }
+        }
+        let new_slice = &new_colors[..new_len];
         if n_used < psize {
-            self.sym.encode_literal(u32::from(new_colors[0]), 8);
-            if new_colors.len() > 1 {
+            self.sym.encode_literal(u32::from(new_slice[0]), 8);
+            if new_slice.len() > 1 {
                 // Minimal initial width covering *every* delta in the
                 // chain (decoder widths only shrink, so the maximum
                 // delta dictates a valid — and optimal — start; using
                 // just the first delta truncates a later larger one).
                 let mut need = 1u32;
-                for w in new_colors.windows(2) {
+                for w in new_slice.windows(2) {
                     let d = w[1] as u32 - w[0] as u32 - 1;
                     if d > 0 {
                         need = need.max(d.ilog2() + 1);
@@ -836,14 +901,14 @@ impl<'a> TileEncoder<'a> {
                 let need = need.clamp(5, 8);
                 self.sym.encode_literal(need - 5, 2);
                 let mut palette_bits = need;
-                for k in 1..new_colors.len() {
-                    let delta = new_colors[k] as u32 - new_colors[k - 1] as u32 - 1;
+                for k in 1..new_slice.len() {
+                    let delta = new_slice[k] as u32 - new_slice[k - 1] as u32 - 1;
                     self.sym.encode_literal(delta, palette_bits);
-                    let prev = u32::from(new_colors[k]);
+                    let prev = u32::from(new_slice[k]);
                     if prev + 1 >= 255 {
                         // Decoder fills any remaining slots with 255 and
                         // stops; only reachable for a trailing 255.
-                        debug_assert!(k + 1 == new_colors.len());
+                        debug_assert!(k + 1 == new_slice.len());
                         break;
                     }
                     // Matches dav1d's `1 + ulog2(max - prev - !pl)` with
@@ -859,10 +924,10 @@ impl<'a> TileEncoder<'a> {
         for y in 0..n4 {
             for x in 0..n4 {
                 let (rr, cc) = (r + y, c + x);
-                self.ymode[rr * self.mi_cols + cc] = DC_PRED as u8;
                 self.skip[rr * self.mi_cols + cc] = 1;
                 self.psize[rr * self.mi_cols + cc] = psize as u8;
-                self.pcolors[rr * self.mi_cols + cc][..psize].copy_from_slice(&colors);
+                self.pcolors[rr * self.mi_cols + cc][..psize]
+                    .copy_from_slice(colors_slice);
             }
         }
         // Mirror dav1d's `splat_intraref`: palette blocks contribute no
@@ -874,14 +939,14 @@ impl<'a> TileEncoder<'a> {
 
         // color_index_map_y: first index via ns(), rest in wavefront order
         // as positions in the neighbour-derived ColorOrder.
-        self.encode_ns(index_map[0] as usize, psize);
+        self.encode_ns(index_slice[0] as usize, psize);
         for i in 1..(2 * bw - 1) {
             let mut j = i.min(bw - 1);
             let j_end = i.saturating_sub(bw - 1);
             loop {
                 let (rr, cc) = (i - j, j);
-                let (order, ctx) = palette_color_context(&index_map, bw, rr, cc, psize);
-                let actual = index_map[rr * bw + cc] as usize;
+                let (order, ctx) = palette_color_context(index_slice, bw, rr, cc, psize);
+                let actual = index_slice[rr * bw + cc] as usize;
                 let sym = order.iter().position(|&x| x == actual).unwrap_or(0);
                 self.cdfs.pal_idx(psize, ctx).encode(&mut self.sym, sym);
                 if j == j_end {
@@ -893,6 +958,47 @@ impl<'a> TileEncoder<'a> {
         // skip = 1 ⇒ read_block_tx_size returns TX_4X4 with no symbols,
         // and residual() codes nothing. Lossless (qindex 0) needs no
         // transform, quantizer, or coefficient syntax at all.
+        Ok(())
+    }
+
+    /// Encode an IntraBC copy for the `bw4`-MI block at `(r, c)` given the
+    /// chosen MV and its predictor: flag + MVD, neighbour bookkeeping
+    /// (skip/psize, no `ymode` — all-DC is implicit), and `record`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_copy(
+        &mut self,
+        r: usize,
+        c: usize,
+        bsl: usize,
+        bw4: usize,
+        my: i32,
+        mx: i32,
+        py: i32,
+        px_: i32,
+    ) -> io::Result<()> {
+        // IntraBC copy: flag, then the MV residual against the
+        // decoder's predictor (replicated refmvs search). No mode,
+        // palette, or index symbols; dav1d records DC/empty palette
+        // contexts for neighbours, mirrored in bookkeeping below.
+        let Some(bc) = self.intrabc.as_mut() else {
+            return Err(io::Error::other(
+                "internal: IntraBC match without IntraBC state",
+            ));
+        };
+        bc.flag(&mut self.sym, true);
+        bc.encode_mvd(&mut self.sym, my, mx, py, px_);
+        let n4 = 1usize << bsl;
+        for y in 0..n4 {
+            for x in 0..n4 {
+                let (rr, cc) = (r + y, c + x);
+                self.skip[rr * self.mi_cols + cc] = 1;
+                self.psize[rr * self.mi_cols + cc] = 0;
+            }
+        }
+        self.intrabc
+            .as_mut()
+            .ok_or_else(|| io::Error::other("internal: missing IntraBC state"))?
+            .record(r, c, bw4, bw4, Some((my, mx)));
         Ok(())
     }
 
@@ -1407,3 +1513,5 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
+
+
