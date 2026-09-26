@@ -185,6 +185,241 @@ const PALETTE_SIZE_4_Y_COLOR: [[u16; 4]; 5] = [
 /// `Palette_Color_Context[]` (§9.3): color-context hash → index context.
 const PALETTE_COLOR_CONTEXT: [i8; 9] = [-1, -1, 0, -1, -1, 4, 3, 2, 1];
 
+// ---------------------------------------------------------------------------
+// Four-shade fast paths: compact masks and tiny lookup tables.
+//
+// Game Boy source pixels use only four shades. The specialized
+// source-analysis path is taken only after verifying every pixel belongs to
+// `GAME_SHADES`; any unsupported value disables the path for the whole image
+// (general fallback, byte-identical to the original scans).
+//
+// Static storage:
+// * `GRAY_TO_SHADE`: 256 bytes (gray value → shade index 0..3, 0xFF invalid).
+// * `MASK_COUNT`: 16 bytes (popcount per 4-bit mask).
+// * `MASK_COLORS`: 64 bytes (sorted source colors per mask, 16×4).
+// * `PAL_LUT`: 1500 bytes (palette-context/symbol per valid neighbor combo,
+//   packed as `(ctx << 2) | sym`, 0xFF invalid; layout
+//   `(((n_idx * 5 + left) * 5 + top) * 5 + tl) * 4 + cur` where `n_idx = n-2`,
+//   `left/top/tl` are 0..3 or 4 for absent, `cur` is 0..3).
+// Total: 256 + 16 + 64 + 1500 = 1836 bytes, plus per-image `masks16`
+// (`(w/16)*(h/16)` bytes, e.g. 5760 B for 1280x1152, 90 B for 160x144).
+// No runtime hash maps; no per-block or per-pixel allocations (masks are
+// once per image, index scratch stays on the stack).
+// ---------------------------------------------------------------------------
+
+/// Game Boy source alphabet, sorted ascending.
+const GAME_SHADES: [u8; 4] = [0, 85, 170, 255];
+
+/// Gray value → shade index 0..3, 0xFF for unsupported values.
+const GRAY_TO_SHADE: [u8; 256] = build_gray_to_shade();
+
+const fn build_gray_to_shade() -> [u8; 256] {
+    let mut t = [0xFFu8; 256];
+    t[0] = 0;
+    t[85] = 1;
+    t[170] = 2;
+    t[255] = 3;
+    t
+}
+
+/// Popcount per 4-bit mask (mask 0..15).
+const MASK_COUNT: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+
+/// Sorted source colors per 4-bit mask: `MASK_COLORS[mask][k]` is the k-th
+/// smallest shade present (`k < MASK_COUNT[mask]`); trailing slots are 0.
+const MASK_COLORS: [[u8; 4]; 16] = build_mask_colors();
+
+const fn build_mask_colors() -> [[u8; 4]; 16] {
+    let mut out = [[0u8; 4]; 16];
+    let mut mask = 0usize;
+    while mask < 16 {
+        let mut k = 0usize;
+        let mut s = 0usize;
+        while s < 4 {
+            if (mask >> s) & 1 == 1 {
+                out[mask][k] = GAME_SHADES[s];
+                k += 1;
+            }
+            s += 1;
+        }
+        mask += 1;
+    }
+    out
+}
+
+/// Palette-context/symbol lookup: `(((n_idx*5+left)*5+top)*5+tl)*4+cur`.
+const PAL_LUT: [u8; 1500] = build_pal_lut();
+
+/// One palette-context entry: packed `(ctx << 2) | sym`, or 0xFF invalid.
+/// Mirrors `palette_color_context` scoring, stable ordering, hash, and
+/// symbol search exactly; `left/top/tl` use 4 for absent.
+const fn pal_entry(n: usize, left: u8, top: u8, tl: u8, cur: u8) -> u8 {
+    if n < 2 || n > 4 {
+        return 0xFF;
+    }
+    if (cur as usize) >= n {
+        return 0xFF;
+    }
+    if left != 4 && (left as usize) >= n {
+        return 0xFF;
+    }
+    if top != 4 && (top as usize) >= n {
+        return 0xFF;
+    }
+    if tl != 4 && (tl as usize) >= n {
+        return 0xFF;
+    }
+    let hl = left != 4;
+    let ht = top != 4;
+    let htl = tl != 4;
+    // Valid wavefront patterns only: top-row (left only), left-col (top
+    // only), or interior (all three). The all-absent first pixel is coded
+    // via ns() and never queries this table.
+    let valid = (hl && !ht && !htl) || (!hl && ht && !htl) || (hl && ht && htl);
+    if !valid {
+        return 0xFF;
+    }
+    let mut scores = [0i32; 8];
+    if hl {
+        scores[left as usize] += 2;
+    }
+    if htl {
+        scores[tl as usize] += 1;
+    }
+    if ht {
+        scores[top as usize] += 2;
+    }
+    let mut order = [0usize; 8];
+    let mut i = 0usize;
+    while i < 8 {
+        order[i] = i;
+        i += 1;
+    }
+    let mut si = 0usize;
+    while si < 3 {
+        let mut max_idx = si;
+        let mut j = si;
+        while j < n {
+            if scores[j] > scores[max_idx] {
+                max_idx = j;
+            }
+            j += 1;
+        }
+        if max_idx != si {
+            let ms = scores[max_idx];
+            let mo = order[max_idx];
+            let mut k = max_idx;
+            while k > si {
+                scores[k] = scores[k - 1];
+                order[k] = order[k - 1];
+                k -= 1;
+            }
+            scores[si] = ms;
+            order[si] = mo;
+        }
+        si += 1;
+    }
+    let hash = (scores[0] + scores[1] * 2 + scores[2] * 2) as usize;
+    if hash >= PALETTE_COLOR_CONTEXT.len() {
+        return 0xFF;
+    }
+    let ctx = PALETTE_COLOR_CONTEXT[hash];
+    if ctx < 0 {
+        return 0xFF;
+    }
+    let mut sym = 0usize;
+    let mut p = 0usize;
+    while p < 8 {
+        if order[p] == cur as usize {
+            sym = p;
+            break;
+        }
+        p += 1;
+    }
+    if sym >= n {
+        return 0xFF;
+    }
+    ((ctx as u8) << 2) | (sym as u8)
+}
+
+const fn build_pal_lut() -> [u8; 1500] {
+    let mut t = [0xFFu8; 1500];
+    let mut n_idx = 0usize;
+    while n_idx < 3 {
+        let n = n_idx + 2;
+        let mut left = 0usize;
+        while left < 5 {
+            let mut top = 0usize;
+            while top < 5 {
+                let mut tl = 0usize;
+                while tl < 5 {
+                    let mut cur = 0usize;
+                    while cur < 4 {
+                        let idx = (((n_idx * 5 + left) * 5 + top) * 5 + tl) * 4 + cur;
+                        t[idx] = pal_entry(n, left as u8, top as u8, tl as u8, cur as u8);
+                        cur += 1;
+                    }
+                    tl += 1;
+                }
+                top += 1;
+            }
+            left += 1;
+        }
+        n_idx += 1;
+    }
+    t
+}
+
+/// Fast palette-context/symbol lookup. Returns `None` for invalid combos
+/// (never queried in valid encodes); callers fall back to the reference
+/// `palette_color_context` to preserve exact behavior.
+#[inline]
+fn pal_lut_lookup(n: usize, left: u8, top: u8, tl: u8, cur: u8) -> Option<(usize, usize)> {
+    if !(2..=4).contains(&n) || cur >= 4 || left > 4 || top > 4 || tl > 4 {
+        return None;
+    }
+    let idx = (((n - 2) * 5 + left as usize) * 5 + top as usize) * 5 + tl as usize;
+    let idx = idx * 4 + cur as usize;
+    let packed = PAL_LUT[idx];
+    if packed == 0xFF {
+        return None;
+    }
+    Some(((packed >> 2) as usize, (packed & 3) as usize))
+}
+
+/// Verify the four-shade invariant and build one 4-bit mask per 16x16
+/// region (row-major, `(w/16)*(h/16)` bytes). Returns `None` on any
+/// unsupported pixel value (general fallback, no silent mapping), on
+/// misaligned dimensions, or on buffer mismatch.
+fn build_source_masks(px: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    if !w.is_multiple_of(16) || !h.is_multiple_of(16) {
+        return None;
+    }
+    if px.len() != w.saturating_mul(h) {
+        return None;
+    }
+    let w16 = w / 16;
+    let h16 = h / 16;
+    let mut masks = vec![0u8; w16.saturating_mul(h16)];
+    for by in 0..h16 {
+        for bx in 0..w16 {
+            let mut m = 0u8;
+            for dy in 0..16 {
+                let base = (by * 16 + dy) * w + bx * 16;
+                for dx in 0..16 {
+                    let s = GRAY_TO_SHADE[px[base + dx] as usize];
+                    if s == 0xFF {
+                        return None;
+                    }
+                    m |= 1 << s;
+                }
+            }
+            masks[by * w16 + bx] = m;
+        }
+    }
+    Some(masks)
+}
+
 /// Partition symbol values.
 const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
@@ -384,6 +619,10 @@ struct TileEncoder<'a> {
     pcolors: Vec<[u8; 8]>,
     above_part: Vec<u8>,
     left_part: Vec<u8>,
+    /// Four-shade source masks (`Some` iff every pixel verified in
+    /// `GAME_SHADES`): one 4-bit mask per 16x16 region, row-major.
+    src_masks: Option<Vec<u8>>,
+    mask_w16: usize,
 }
 
 /// `Partition_Context` update table (§5.11.4), rows [above|left],
@@ -393,7 +632,13 @@ const AL_PART_NONE_ABOVE: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 const AL_PART_NONE_LEFT: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 
 impl<'a> TileEncoder<'a> {
-    fn new(px: &'a [u8], w: usize, h: usize, use_intrabc: bool) -> io::Result<Self> {
+    fn new(
+        px: &'a [u8],
+        w: usize,
+        h: usize,
+        use_intrabc: bool,
+        src_masks: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
         if w > u32::MAX as usize || h > u32::MAX as usize {
             return Err(invalid_input(format!(
                 "dimensions exceed u32 range, got {w}x{h}"
@@ -413,6 +658,7 @@ impl<'a> TileEncoder<'a> {
         if let Some(bc) = intrabc.as_mut() {
             bc.build_pattern_cache(px, w, h);
         }
+        let mask_w16 = w / 16;
         Ok(Self {
             px,
             w,
@@ -427,6 +673,8 @@ impl<'a> TileEncoder<'a> {
             pcolors: vec![[0u8; 8]; mi_area],
             above_part: vec![0; mi_cols],
             left_part: vec![0; mi_rows],
+            src_masks,
+            mask_w16,
         })
     }
 
@@ -434,10 +682,47 @@ impl<'a> TileEncoder<'a> {
         self.px[y * self.w + x]
     }
 
+    /// Combined 4-bit source mask for the `bw4`-MI square at MI `(r, c)`.
+    /// Returns `None` when the four-shade path is disabled or the region is
+    /// not fully on-screen (preserves the original boundary behavior via
+    /// fallback scans).
+    fn combined_mask(&self, r: usize, c: usize, bw4: usize) -> Option<u8> {
+        let masks = self.src_masks.as_ref()?;
+        if r.saturating_add(bw4) > self.mi_rows || c.saturating_add(bw4) > self.mi_cols {
+            return None;
+        }
+        // MI (r,c) → pixel (sx,sy); 16px cells → mask grid. All terminal
+        // blocks are 16-aligned here, so the rect covers whole cells.
+        let sx = c * 4;
+        let sy = r * 4;
+        let bw = bw4 * 4;
+        if !sx.is_multiple_of(16) || !sy.is_multiple_of(16) || !bw.is_multiple_of(16) {
+            return None;
+        }
+        let x0 = sx / 16;
+        let y0 = sy / 16;
+        let n = bw / 16;
+        let mut m = 0u8;
+        for dy in 0..n {
+            let base = (y0 + dy) * self.mask_w16 + x0;
+            for dx in 0..n {
+                m |= masks[base + dx];
+                if m == 0x0F {
+                    // Mask full; remaining ORs cannot change popcount, but
+                    // keep combining cheaply (few cells max: 4x4).
+                }
+            }
+        }
+        Some(m)
+    }
+
     /// Count of distinct levels in the `bw4`-MI region at MI `(r, c)`,
     /// saturating at 5 (only the ≤4 question matters: larger palettes
     /// have no index tables in this encoder).
     fn region_levels(&self, r: usize, c: usize, bw4: usize) -> usize {
+        if let Some(m) = self.combined_mask(r, c, bw4) {
+            return MASK_COUNT[(m & 0x0F) as usize] as usize;
+        }
         let px = bw4 * 4;
         let (sx, sy) = (c * 4, r * 4);
         let xe = (sx + px).min(self.w);
@@ -737,15 +1022,22 @@ impl<'a> TileEncoder<'a> {
 
         // Distinct-level scan doubles as the flat test (single-level
         // blocks always take the palette path — a copy can't beat a
-        // ~15-bit flat table). The `set` is reused below to build the
-        // palette colors, so this scan is not wasted on the palette path.
-        let mut set = [false; 256];
-        for i in 0..bw {
-            for j in 0..bw {
-                set[self.sample(sx + j, sy + i) as usize] = true;
+        // ~15-bit flat table). On the verified four-shade path the
+        // precomputed 16x16 masks are combined instead of rescanning
+        // 256-entry presence arrays; otherwise the original scan runs.
+        let fast_mask = self.combined_mask(r, c, bw4);
+        let (distinct, set) = if let Some(m) = fast_mask {
+            (MASK_COUNT[(m & 0x0F) as usize] as usize, None)
+        } else {
+            let mut set = [false; 256];
+            for i in 0..bw {
+                for j in 0..bw {
+                    set[self.sample(sx + j, sy + i) as usize] = true;
+                }
             }
-        }
-        let distinct = set.iter().filter(|&&b| b).count();
+            let distinct = set.iter().filter(|&&b| b).count();
+            (distinct, Some(set))
+        };
         if distinct == 0 {
             return Err(invalid_input(format!(
                 "empty palette block at MI ({r},{c}) size {bw}x{bw}"
@@ -775,18 +1067,36 @@ impl<'a> TileEncoder<'a> {
         // now that the copy path is ruled out.
         let mut colors = [0u8; 4];
         let mut psize: usize = 0;
-        for (v, &present) in set.iter().enumerate() {
-            if present {
-                if psize < 4 {
-                    colors[psize] = v as u8;
-                    psize += 1;
-                } else {
-                    // More than 4 distinct: palette path is unsupported
-                    // (no index tables). Count for the error below.
-                    psize = distinct;
-                    break;
+        if let Some(m) = fast_mask {
+            // Verified four-shade path: sorted source palette straight from
+            // the 4-bit mask (shades ascending, matching the 0..256 scan
+            // order for this alphabet). At most 4 distinct by construction.
+            let mm = (m & 0x0F) as usize;
+            let cnt = MASK_COUNT[mm] as usize;
+            debug_assert_eq!(cnt, distinct);
+            colors[..cnt].copy_from_slice(&MASK_COLORS[mm][..cnt]);
+            psize = cnt;
+        } else if let Some(ref set_ref) = set {
+            for (v, &present) in set_ref.iter().enumerate() {
+                if present {
+                    if psize < 4 {
+                        colors[psize] = v as u8;
+                        psize += 1;
+                    } else {
+                        // More than 4 distinct: palette path is unsupported
+                        // (no index tables). Count for the error below.
+                        psize = distinct;
+                        break;
+                    }
                 }
             }
+        } else {
+            // Unreachable: `fast_mask` is `None` exactly when `set` is
+            // `Some` (see distinct scan above).
+            debug_assert!(false, "internal: neither mask nor set for palette");
+            return Err(io::Error::other(
+                "internal: neither mask nor set for palette",
+            ));
         }
         // `distinct` is authoritative; `psize` above is `min(distinct,4)`
         // unless overflow. Re-derive for the flat-pad and error paths.
@@ -832,6 +1142,20 @@ impl<'a> TileEncoder<'a> {
         }
 
         let colors_slice = &colors[..psize];
+        // Small direct mapping for the verified four-shade path:
+        // shade index (0..3 via `GRAY_TO_SHADE`) → palette index. Flat-block
+        // padding outside the four shades is never referenced by source
+        // pixels, so its slot stays unmapped. General fallback keeps the
+        // original per-pixel search exactly.
+        let mut shade_to_pal = [0u8; 4];
+        if fast_mask.is_some() {
+            for (k, &cc) in colors_slice.iter().enumerate() {
+                let s = GRAY_TO_SHADE[cc as usize];
+                if s != 0xFF {
+                    shade_to_pal[s as usize] = k as u8;
+                }
+            }
+        }
         // Reusable index-map scratch: 64x64 max = 4096 bytes on the stack,
         // no per-block heap. Only the first `bw*bw` entries are used.
         let mut index_map = [0u8; 4096];
@@ -841,19 +1165,27 @@ impl<'a> TileEncoder<'a> {
         // with the local scratch (disjoint-field friendly).
         let px_ref = self.px;
         let w_ref = self.w;
+        let use_shade_lut = fast_mask.is_some();
         for i in 0..bw {
             let row_off = (sy + i) * w_ref + sx;
             for j in 0..bw {
                 let v = px_ref[row_off + j];
-                // `colors_slice` is sorted; linear scan over ≤4 entries
-                // is cheaper than `binary_search` setup.
-                let mut idx = 0u8;
-                for (k, &cc) in colors_slice.iter().enumerate() {
-                    if cc == v {
-                        idx = k as u8;
-                        break;
+                let idx = if use_shade_lut {
+                    let s = GRAY_TO_SHADE[v as usize];
+                    debug_assert!(s != 0xFF, "four-shade path hit unsupported pixel {v}");
+                    shade_to_pal[s as usize]
+                } else {
+                    // `colors_slice` is sorted; linear scan over ≤4 entries
+                    // is cheaper than `binary_search` setup.
+                    let mut idx = 0u8;
+                    for (k, &cc) in colors_slice.iter().enumerate() {
+                        if cc == v {
+                            idx = k as u8;
+                            break;
+                        }
                     }
-                }
+                    idx
+                };
                 index_map[i * bw + j] = idx;
             }
         }
@@ -967,16 +1299,43 @@ impl<'a> TileEncoder<'a> {
         }
 
         // color_index_map_y: first index via ns(), rest in wavefront order
-        // as positions in the neighbour-derived ColorOrder.
+        // as positions in the neighbour-derived ColorOrder. The tiny
+        // `PAL_LUT` replaces repeated scoring/ordering/searches; on a LUT
+        // miss (unreachable for valid 2..4 palettes) the reference
+        // calculation runs to preserve exact behavior.
         self.encode_ns(index_slice[0] as usize, psize);
         for i in 1..(2 * bw - 1) {
             let mut j = i.min(bw - 1);
             let j_end = i.saturating_sub(bw - 1);
             loop {
                 let (rr, cc) = (i - j, j);
-                let (order, ctx) = palette_color_context(index_slice, bw, rr, cc, psize);
-                let actual = index_slice[rr * bw + cc] as usize;
-                let sym = order.iter().position(|&x| x == actual).unwrap_or(0);
+                let actual = index_slice[rr * bw + cc];
+                let left = if cc > 0 {
+                    index_slice[rr * bw + (cc - 1)]
+                } else {
+                    4
+                };
+                let top = if rr > 0 {
+                    index_slice[(rr - 1) * bw + cc]
+                } else {
+                    4
+                };
+                let tl = if rr > 0 && cc > 0 {
+                    index_slice[(rr - 1) * bw + (cc - 1)]
+                } else {
+                    4
+                };
+                let (ctx, sym) = if let Some((c, s)) = pal_lut_lookup(psize, left, top, tl, actual)
+                {
+                    (c, s)
+                } else {
+                    let (order, ctx) = palette_color_context(index_slice, bw, rr, cc, psize);
+                    let sym = order
+                        .iter()
+                        .position(|&x| x == actual as usize)
+                        .unwrap_or(0);
+                    (ctx, sym)
+                };
                 self.cdfs.pal_idx(psize, ctx).encode(&mut self.sym, sym);
                 if j == j_end {
                     break;
@@ -1238,8 +1597,12 @@ fn check_supported_colors(gray: &[u8], w: u32, h: u32) -> io::Result<()> {
 
 /// Boundary validation for the `io::Result` entry points: dimensions,
 /// checked area, buffer length, and supported colors. Returns
-/// `InvalidInput` instead of panicking.
-fn validate_gray(gray: &[u8], w: u32, h: u32) -> io::Result<usize> {
+/// `InvalidInput` instead of panicking. On success also returns the
+/// verified four-shade masks (`Some` iff every pixel is in `GAME_SHADES`);
+/// verified images skip the per-16x16 256-entry color scan since ≤4 colors
+/// per block hold by construction, while unverified images run the original
+/// detailed check (preserving arbitrary-gray acceptance and rejection).
+fn validate_gray(gray: &[u8], w: u32, h: u32) -> io::Result<(usize, Option<Vec<u8>>)> {
     check_supported_dimensions(w, h)?;
     let area = checked_area(w, h)?;
     if gray.len() != area {
@@ -1248,8 +1611,11 @@ fn validate_gray(gray: &[u8], w: u32, h: u32) -> io::Result<usize> {
             gray.len()
         )));
     }
-    check_supported_colors(gray, w, h)?;
-    Ok(area)
+    let masks = build_source_masks(gray, w as usize, h as usize);
+    if masks.is_none() {
+        check_supported_colors(gray, w, h)?;
+    }
+    Ok((area, masks))
 }
 
 /// Uncompressed frame header bits for our KEY still, then byte-aligned.
@@ -1350,9 +1716,9 @@ fn encode_obu_payload_with(
     h: u32,
     use_intrabc: bool,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
-    validate_gray(gray, w, h)?;
+    let (_, masks) = validate_gray(gray, w, h)?;
 
-    let tile = TileEncoder::new(gray, w as usize, h as usize, use_intrabc)?;
+    let tile = TileEncoder::new(gray, w as usize, h as usize, use_intrabc, masks)?;
     let tile_data = tile.finish()?;
 
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
@@ -1586,5 +1952,472 @@ mod tests {
             !err.to_string().contains("at most"),
             "boundary 65536 must pass the dimension cap: {err}"
         );
+    }
+
+    #[test]
+    fn gray_to_shade_mapping() {
+        assert_eq!(GRAY_TO_SHADE[0], 0);
+        assert_eq!(GRAY_TO_SHADE[85], 1);
+        assert_eq!(GRAY_TO_SHADE[170], 2);
+        assert_eq!(GRAY_TO_SHADE[255], 3);
+        // Every other value is unsupported (0xFF, never silently mapped).
+        for (v, &entry) in GRAY_TO_SHADE.iter().enumerate() {
+            if ![0, 85, 170, 255].contains(&(v as u8)) {
+                assert_eq!(entry, 0xFF, "gray {v} must be invalid");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_tables_exhaustive() {
+        // Every 4-bit mask: popcount and sorted source palette.
+        for (mask, &count) in MASK_COUNT.iter().enumerate() {
+            let count = count as usize;
+            assert_eq!(count, (mask as u8).count_ones() as usize, "mask {mask:04b}");
+            let mut expected = [0u8; 4];
+            let mut k = 0usize;
+            for (s, &shade) in GAME_SHADES.iter().enumerate() {
+                if (mask >> s) & 1 == 1 {
+                    expected[k] = shade;
+                    k += 1;
+                }
+            }
+            assert_eq!(k, count, "mask {mask:04b}");
+            assert_eq!(&MASK_COLORS[mask][..count], &expected[..count]);
+            // Sorted ascending (GAME_SHADES sorted).
+            for w in MASK_COLORS[mask][..count].windows(2) {
+                assert!(w[0] < w[1], "mask {mask:04b} unsorted");
+            }
+        }
+        // Empty mask has zero colors; every nonempty mask has 1..4.
+        assert_eq!(MASK_COUNT[0], 0);
+        for &count in MASK_COUNT.iter().skip(1) {
+            assert!((1..=4).contains(&count));
+        }
+    }
+
+    #[test]
+    fn source_masks_match_reference_scans() {
+        // For every nonempty mask, build a 16x16 block realizing exactly that
+        // mask (quadrants carry the set shades), then verify the mask path
+        // (popcount + sorted palette) matches the original 256-entry scan.
+        for mask in 1..16u8 {
+            let bits: Vec<u8> = (0..4u8).filter(|s| (mask >> s) & 1 == 1).collect();
+            let mut block = vec![0u8; 16 * 16];
+            for y in 0..16 {
+                for x in 0..16 {
+                    let q = (y / 8) * 2 + (x / 8);
+                    let s = bits[q % bits.len()];
+                    block[y * 16 + x] = GAME_SHADES[s as usize];
+                }
+            }
+            // Reference distinct + sorted palette via 256-entry scan.
+            let mut set = [false; 256];
+            for &v in &block {
+                set[v as usize] = true;
+            }
+            let distinct_ref = set.iter().filter(|&&b| b).count();
+            let mut colors_ref = [0u8; 4];
+            let mut k = 0usize;
+            for (v, &p) in set.iter().enumerate() {
+                if p {
+                    colors_ref[k] = v as u8;
+                    k += 1;
+                }
+            }
+            assert_eq!(distinct_ref, MASK_COUNT[mask as usize] as usize);
+            assert_eq!(
+                &colors_ref[..distinct_ref],
+                &MASK_COLORS[mask as usize][..distinct_ref]
+            );
+            // `build_source_masks` on a single-block image agrees.
+            let masks = build_source_masks(&block, 16, 16).expect("four-shade must verify");
+            assert_eq!(masks, vec![mask]);
+        }
+        // Unsupported values reject the whole image (no silent mapping).
+        let mut bad = vec![0u8; 16 * 16];
+        bad[100] = 1;
+        assert!(build_source_masks(&bad, 16, 16).is_none());
+        // Misaligned dimensions or length mismatch also fall back.
+        assert!(build_source_masks(&vec![0u8; 16 * 16], 30, 16).is_none());
+        assert!(build_source_masks(&[0u8; 10], 16, 16).is_none());
+    }
+
+    #[test]
+    fn hierarchical_masks_match_scans() {
+        // Random 64x64 four-shade image: combined 32x32/64x64 masks must give
+        // the same distinct counts as the original 256-entry scans,
+        // preserving partition decisions.
+        let mut px = vec![0u8; 64 * 64];
+        let levels = [0u8, 85, 170, 255];
+        for y in 0..64 {
+            for x in 0..64 {
+                px[y * 64 + x] = levels[(x * 5 + y * 11 + (x / 16) * 3) % 4];
+            }
+        }
+        let masks = build_source_masks(&px, 64, 64).expect("must verify");
+        assert_eq!(masks.len(), 16);
+        let reference_distinct = |sx: usize, sy: usize, bw: usize| {
+            let mut set = [false; 256];
+            let mut n = 0usize;
+            for y in sy..sy + bw {
+                for x in sx..sx + bw {
+                    let v = px[y * 64 + x] as usize;
+                    if !set[v] {
+                        set[v] = true;
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        // 32x32 quadrants (2x2 masks each).
+        for (bx, by) in [(0, 0), (32, 0), (0, 32), (32, 32)] {
+            let mut m = 0u8;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    m |= masks[(by / 16 + dy) * 4 + (bx / 16 + dx)];
+                }
+            }
+            assert_eq!(
+                MASK_COUNT[m as usize] as usize,
+                reference_distinct(bx, by, 32),
+                "32x32 at ({bx},{by})"
+            );
+        }
+        // Full 64x64 (4x4 masks).
+        let m = masks.iter().fold(0u8, |a, &b| a | b);
+        assert_eq!(
+            MASK_COUNT[m as usize] as usize,
+            reference_distinct(0, 0, 64)
+        );
+    }
+
+    #[test]
+    fn shade_to_palette_mapping_matches_search() {
+        // Every nonempty mask: shade→palette table reproduces the per-pixel
+        // linear search for all source pixels. Flat masks exercise the
+        // padding path (cached pad inside/outside the four shades).
+        for mask in 1..16u8 {
+            let cnt = MASK_COUNT[mask as usize] as usize;
+            let src_colors = &MASK_COLORS[mask as usize][..cnt];
+            // Representative palettes: non-flat as-is; flat with several pad
+            // choices (cached four-shade, arbitrary outside, adjacent).
+            let palettes: Vec<Vec<u8>> = if cnt > 1 {
+                vec![src_colors.to_vec()]
+            } else {
+                let v = src_colors[0];
+                let mut cands = vec![];
+                for pad in [1u8, 2, 84, 86, 169, 171, 254, 0, 85, 170, 255] {
+                    if pad == v {
+                        continue;
+                    }
+                    let mut p = vec![v, pad];
+                    p.sort_unstable();
+                    if !cands.contains(&p) {
+                        cands.push(p);
+                    }
+                }
+                cands
+            };
+            for palette in palettes {
+                let psize = palette.len();
+                // Build shade→palette exactly like the encoder fast path.
+                let mut shade_to_pal = [0u8; 4];
+                for (k, &cc) in palette.iter().enumerate() {
+                    let s = GRAY_TO_SHADE[cc as usize];
+                    if s != 0xFF {
+                        shade_to_pal[s as usize] = k as u8;
+                    }
+                }
+                // Every source shade present in the mask must map to the
+                // same index as the linear search.
+                for (s, &shade) in GAME_SHADES.iter().enumerate() {
+                    if (mask >> s) & 1 == 0 {
+                        continue;
+                    }
+                    let mut expect = 0u8;
+                    for (k, &cc) in palette.iter().enumerate() {
+                        if cc == shade {
+                            expect = k as u8;
+                            break;
+                        }
+                    }
+                    // Flat pad outside the alphabet is never referenced;
+                    // present shades always hit their palette entry.
+                    assert_eq!(
+                        shade_to_pal[s], expect,
+                        "mask {mask:04b} palette {palette:?}"
+                    );
+                }
+                assert!(psize == 2 || psize == cnt);
+            }
+        }
+    }
+
+    #[test]
+    fn palette_lut_matches_reference_exhaustive() {
+        // Every valid (n, left, top, tl, cur): LUT context+symbol equals the
+        // reference scoring/ordering/position logic, including tie-breaks
+        // and block-edge availabilities. First-pixel (all absent) excluded
+        // (coded via ns(), never queried).
+        let mut checked = 0usize;
+        for n in 2..=4usize {
+            // Top-row: left only.
+            for left in 0..n as u8 {
+                for cur in 0..n as u8 {
+                    // Build minimal 2-wide map to place neighbors: use 16x16
+                    // scratch with r=0,c=1, left at (0,0).
+                    let bw = 16;
+                    let mut color_map = vec![0u8; bw * bw];
+                    color_map[0] = left;
+                    color_map[1] = cur;
+                    let (order, ctx_ref) = palette_color_context(&color_map, bw, 0, 1, n);
+                    let sym_ref = order.iter().position(|&x| x == cur as usize).unwrap_or(0);
+                    let (ctx, sym) = pal_lut_lookup(n, left, 4, 4, cur).expect("top-row must hit");
+                    assert_eq!(
+                        (ctx, sym),
+                        (ctx_ref, sym_ref),
+                        "n={n} top-row l={left} cur={cur}"
+                    );
+                    checked += 1;
+                }
+            }
+            // Left-col: top only.
+            for top in 0..n as u8 {
+                for cur in 0..n as u8 {
+                    let bw = 16;
+                    let mut color_map = vec![0u8; bw * bw];
+                    color_map[0] = top;
+                    color_map[bw] = cur;
+                    let (order, ctx_ref) = palette_color_context(&color_map, bw, 1, 0, n);
+                    let sym_ref = order.iter().position(|&x| x == cur as usize).unwrap_or(0);
+                    let (ctx, sym) = pal_lut_lookup(n, 4, top, 4, cur).expect("left-col must hit");
+                    assert_eq!(
+                        (ctx, sym),
+                        (ctx_ref, sym_ref),
+                        "n={n} left-col t={top} cur={cur}"
+                    );
+                    checked += 1;
+                }
+            }
+            // Interior: all three neighbors, all index combos.
+            for left in 0..n as u8 {
+                for top in 0..n as u8 {
+                    for tl in 0..n as u8 {
+                        for cur in 0..n as u8 {
+                            let bw = 16;
+                            let mut color_map = vec![0u8; bw * bw];
+                            // Place at (1,1): left (1,0), tl (0,0), top (0,1).
+                            color_map[bw] = left;
+                            color_map[0] = tl;
+                            color_map[1] = top;
+                            color_map[bw + 1] = cur;
+                            let (order, ctx_ref) = palette_color_context(&color_map, bw, 1, 1, n);
+                            let sym_ref =
+                                order.iter().position(|&x| x == cur as usize).unwrap_or(0);
+                            let (ctx, sym) =
+                                pal_lut_lookup(n, left, top, tl, cur).expect("interior must hit");
+                            assert_eq!(
+                                (ctx, sym),
+                                (ctx_ref, sym_ref),
+                                "n={n} l={left} t={top} tl={tl} cur={cur}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Top-row (4+9+16) + left-col (4+9+16) + interior (16+81+256) = 411.
+        assert_eq!(checked, 411, "must cover all valid combos");
+        // Invalid combos miss (fallback preserves exact behavior).
+        assert!(pal_lut_lookup(2, 2, 4, 4, 0).is_none());
+        assert!(pal_lut_lookup(2, 0, 4, 4, 2).is_none());
+        assert!(pal_lut_lookup(4, 0, 4, 0, 0).is_none());
+        assert!(pal_lut_lookup(5, 0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn arbitrary_gray_fallback_preserved() {
+        use std::io::ErrorKind;
+        // Accepted arbitrary-gray inputs (≤4 per 16x16, values outside the
+        // four shades) still encode via the general fallback on both paths.
+        let mut gray = vec![0u8; 64 * 64];
+        for y in 0..64 {
+            for x in 0..64 {
+                gray[y * 64 + x] = [10u8, 20, 30, 40][(x + y) % 4];
+            }
+        }
+        let (_, masks) = validate_gray(&gray, 64, 64).unwrap();
+        assert!(masks.is_none(), "arbitrary grays must not take mask path");
+        encode_obu_payload_with(&gray, 64, 64, false).unwrap();
+        encode_obu_payload_with(&gray, 64, 64, true).unwrap();
+        encode_gray(&gray, 64, 64).unwrap();
+        // Single unsupported pixel in an otherwise four-shade image also
+        // falls back (no silent mapping) but still encodes (≤4 per block).
+        let mut mixed = vec![0u8; 16 * 16];
+        mixed.fill(0);
+        mixed[0] = 1;
+        mixed[1] = 85;
+        let (_, masks) = validate_gray(&mixed, 16, 16).unwrap();
+        assert!(masks.is_none());
+        encode_gray(&mixed, 16, 16).unwrap();
+        // Too many distinct still rejected identically on both paths.
+        let mut many = vec![0u8; 16 * 16];
+        for (i, v) in many.iter_mut().enumerate() {
+            *v = (i % 5) as u8;
+        }
+        let err = encode_gray(&many, 16, 16).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn fast_vs_fallback_tile_byte_identical() {
+        // Four-shade images: fast mask/LUT paths must produce byte-identical
+        // tile data to the original fallback scans/searches, for both
+        // palette-only and IntraBC-enabled encodings (so picking cannot hide
+        // a regression). Fallback is forced by passing `None` masks directly.
+        fn tile_bytes(
+            gray: &[u8],
+            w: usize,
+            h: usize,
+            use_intrabc: bool,
+            masks: Option<Vec<u8>>,
+        ) -> Vec<u8> {
+            TileEncoder::new(gray, w, h, use_intrabc, masks)
+                .unwrap()
+                .finish()
+                .unwrap()
+        }
+        fn corpus() -> Vec<(Vec<u8>, usize, usize)> {
+            let mut out = Vec::new();
+            // Flat (exercises pad inside/outside alphabet via cache evolution).
+            out.push((vec![0u8; 16 * 16], 16, 16));
+            out.push((vec![255u8; 16 * 16], 16, 16));
+            out.push((vec![85u8; 32 * 32], 32, 32));
+            // Checker 8px.
+            let mut chk = vec![0u8; 64 * 64];
+            for y in 0..64 {
+                for x in 0..64 {
+                    chk[y * 64 + x] = if ((x / 8) + (y / 8)) % 2 == 0 { 0 } else { 255 };
+                }
+            }
+            out.push((chk, 64, 64));
+            // Random four-shade 64x64.
+            let levels = [0u8, 85, 170, 255];
+            let mut rnd = vec![0u8; 64 * 64];
+            for y in 0..64 {
+                for x in 0..64 {
+                    rnd[y * 64 + x] = levels[(x * 7 + y * 13) % 4];
+                }
+            }
+            out.push((rnd, 64, 64));
+            // All 15 masks tiled as 16x16 blocks in a 64x64 image.
+            let mut all = vec![0u8; 64 * 64];
+            for by in 0..4 {
+                for bx in 0..4 {
+                    let mask = ((by * 4 + bx) % 15 + 1) as u8;
+                    let bits: Vec<u8> = (0..4u8).filter(|s| (mask >> s) & 1 == 1).collect();
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            let q = (y / 8) * 2 + (x / 8);
+                            let s = bits[q % bits.len()];
+                            all[(by * 16 + y) * 64 + (bx * 16 + x)] =
+                                [0u8, 85, 170, 255][s as usize];
+                        }
+                    }
+                }
+            }
+            out.push((all, 64, 64));
+            out
+        }
+        for (gray, w, h) in corpus() {
+            let masks = build_source_masks(&gray, w, h).expect("corpus must verify");
+            for use_intrabc in [false, true] {
+                let fast = tile_bytes(&gray, w, h, use_intrabc, Some(masks.clone()));
+                let slow = tile_bytes(&gray, w, h, use_intrabc, None);
+                assert_eq!(fast, slow, "tile mismatch {w}x{h} intrabc={use_intrabc}");
+                // Full payloads (headers + tile) must also match the public
+                // entry points which use the fast path internally.
+                let (fast_payload, _) =
+                    encode_obu_payload_with(&gray, w as u32, h as u32, use_intrabc).unwrap();
+                // Rebuild slow payload with identical headers.
+                let slow_tile = slow;
+                let seq_obu = obu_wrap(1, &sequence_header_obu(w as u32, h as u32));
+                let mut frame_payload = frame_header_bits(w as u32, h as u32, use_intrabc).unwrap();
+                frame_payload.extend_from_slice(&slow_tile);
+                let frame_obu = obu_wrap(6, &frame_payload);
+                let mut slow_payload = seq_obu;
+                slow_payload.extend_from_slice(&frame_obu);
+                assert_eq!(fast_payload, slow_payload);
+            }
+        }
+    }
+
+    /// Manual benchmark (ignored by default): median of 5 runs for
+    /// palette-only, IntraBC-enabled, and complete (picking) paths on
+    /// representative four-shade rasters. Run with:
+    /// `cargo test --release bench_modes_manual -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn bench_modes_manual() {
+        fn median(mut v: Vec<std::time::Duration>) -> std::time::Duration {
+            v.sort_unstable();
+            v[v.len() / 2]
+        }
+        // Deterministic 160x144 four-shade photo-like raster + 8x upscale.
+        let (sw, sh) = (160usize, 144usize);
+        let mut small = vec![0u8; sw * sh];
+        let levels = [0u8, 85, 170, 255];
+        for y in 0..sh {
+            for x in 0..sw {
+                small[y * sw + x] = levels[(x * 7 + y * 13) % 4];
+            }
+        }
+        let (lw, lh) = (1280usize, 1152usize);
+        let mut large = vec![0u8; lw * lh];
+        for y in 0..lh {
+            for x in 0..lw {
+                large[y * lw + x] = small[(y / 8) * sw + (x / 8)];
+            }
+        }
+        for (name, gray, w, h) in [
+            ("small160", &small, 160u32, 144u32),
+            ("large1280", &large, 1280u32, 1152u32),
+        ] {
+            let mut off = Vec::new();
+            let mut on = Vec::new();
+            let mut picked = Vec::new();
+            let mut paired = Vec::new();
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                encode_obu_payload_with(gray, w, h, false).unwrap();
+                off.push(t.elapsed());
+                let t = std::time::Instant::now();
+                encode_obu_payload_with(gray, w, h, true).unwrap();
+                on.push(t.elapsed());
+                let t = std::time::Instant::now();
+                encode_obu_payload(gray, w, h).unwrap();
+                picked.push(t.elapsed());
+            }
+            // Pair path (both rasters + container) measured separately.
+            if name == "small160" {
+                for _ in 0..5 {
+                    let t = std::time::Instant::now();
+                    encode_gray_pair(&small, 160, 144, &large, 1280, 1152).unwrap();
+                    paired.push(t.elapsed());
+                }
+            }
+            eprintln!(
+                "bench {name}: palette-only median {:?}, intrabc median {:?}, complete median {:?}",
+                median(off),
+                median(on),
+                median(picked)
+            );
+            if !paired.is_empty() {
+                eprintln!("bench pair: complete median {:?}", median(paired));
+            }
+        }
     }
 }
