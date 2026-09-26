@@ -41,6 +41,24 @@ use std::io;
 mod intrabc;
 use intrabc::IntrabcState;
 
+/// Cached-search diagnostics for the 16x16 8x path: `(queries, fallbacks)`.
+/// `queries` counts verified-image 16x16 attempts; `fallbacks` counts the
+/// narrow stripe fallbacks to the ring oracle. Both are process-global
+/// atomics (Rayon-safe); reset per measurement.
+// Diagnostics for tests/benchmarks; unused by the extraction binary itself,
+// so `dead_code` would otherwise fire on the non-test build.
+#[allow(dead_code)]
+pub fn pattern_cache_stats() -> (u64, u64) {
+    intrabc::pattern_stats()
+}
+
+/// Reset cached-search diagnostics.
+// See `pattern_cache_stats` for the `dead_code` rationale.
+#[allow(dead_code)]
+pub fn reset_pattern_cache_stats() {
+    intrabc::reset_pattern_stats()
+}
+
 /// Code toggle for IntraBC (intra block copy) evaluation: exact
 /// pixel-rectangle copies from causal decoded area via integer MVs +
 /// `skip = 1`, as a per-block alternative to the palette path. When `true`,
@@ -388,6 +406,13 @@ impl<'a> TileEncoder<'a> {
         let mi_area = mi_cols.checked_mul(mi_rows).ok_or_else(|| {
             invalid_input(format!("MI grid area overflows usize: {mi_cols}x{mi_rows}"))
         })?;
+        let mut intrabc = use_intrabc.then(|| IntrabcState::new(mi_cols, mi_rows));
+        // Verify the 8x nearest-neighbor invariant once per image and
+        // precompute the bounded per-key lists when it holds. Unverified
+        // images keep the original ring behavior exactly.
+        if let Some(bc) = intrabc.as_mut() {
+            bc.build_pattern_cache(px, w, h);
+        }
         Ok(Self {
             px,
             w,
@@ -396,7 +421,7 @@ impl<'a> TileEncoder<'a> {
             mi_rows,
             sym: SymbolEncoder::new(),
             cdfs: Cdfs::new(),
-            intrabc: use_intrabc.then(|| IntrabcState::new(mi_cols, mi_rows)),
+            intrabc,
             skip: vec![0; mi_area],
             psize: vec![0; mi_area],
             pcolors: vec![[0u8; 8]; mi_area],
