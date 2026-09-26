@@ -9,6 +9,12 @@
 //!   block's exact colors — no transform, quantization, or coefficient
 //!   coding exists on this path at all, which is what makes a from-scratch
 //!   encoder feasible.
+//! * Optionally (code toggle `USE_INTRABC`, segregated in `intrabc.rs`), a
+//!   block with an exact match in causal decoded area is coded as an
+//!   IntraBC copy instead: `skip = 1` with an integer motion vector and no
+//!   residuals. The MV predictor replicates dav1d's refmvs search; match
+//!   validity is conservative against the decoder's SB-overlap/tile-clip
+//!   rules, so its adjustments never trigger.
 //! * Static default CDFs are the starting point, but every `S()` symbol
 //!   adapts its row (`disable_cdf_update = 0`) except split_or outcomes,
 //!   which dav1d decodes with the non-updating bool reader; no
@@ -29,6 +35,16 @@ use gamut_isobmff::{
     EntityGroup, IsoBmffImage, Item, Property, PropertyKind, write as write_isobmff,
 };
 use std::io;
+
+mod intrabc;
+use intrabc::IntrabcState;
+
+/// Code toggle for IntraBC (intra block copy) items: exact pixel-rectangle
+/// copies from causal decoded area via integer MVs + `skip = 1`, as a
+/// per-block alternative to the palette path. `false` restores
+/// byte-identical output to the pre-IntraBC encoder (no flag symbols, no
+/// header bit).
+const USE_INTRABC: bool = true;
 
 // ---------------------------------------------------------------------------
 // Default CDF tables (AV1 §9.3/§9.4), transcribed for the symbols we emit.
@@ -317,10 +333,14 @@ fn palette_color_context(
 struct TileEncoder<'a> {
     px: &'a [u8],
     w: usize,
+    h: usize,
     mi_cols: usize,
     mi_rows: usize,
     sym: SymbolEncoder,
     cdfs: Cdfs,
+    /// `None` disables IntraBC entirely (byte-identical to the pre-IntraBC
+    /// encoder: no flag symbols, no header bit — see `USE_INTRABC`).
+    intrabc: Option<IntrabcState>,
     ymode: Vec<u8>,
     skip: Vec<u8>,
     psize: Vec<u8>,
@@ -336,17 +356,19 @@ const AL_PART_NONE_ABOVE: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 const AL_PART_NONE_LEFT: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 
 impl<'a> TileEncoder<'a> {
-    fn new(px: &'a [u8], w: usize, h: usize) -> Self {
+    fn new(px: &'a [u8], w: usize, h: usize, use_intrabc: bool) -> Self {
         assert!(w.is_multiple_of(16) && h.is_multiple_of(16), "dimensions must be 16-aligned");
         let mi_cols = w / 4;
         let mi_rows = h / 4;
         Self {
             px,
             w,
+            h,
             mi_cols,
             mi_rows,
             sym: SymbolEncoder::new(),
             cdfs: Cdfs::new(),
+            intrabc: use_intrabc.then(|| IntrabcState::new(mi_cols, mi_rows)),
             ymode: vec![0; mi_cols * mi_rows],
             skip: vec![0; mi_cols * mi_rows],
             psize: vec![0; mi_cols * mi_rows],
@@ -412,13 +434,25 @@ impl<'a> TileEncoder<'a> {
         }
     }
 
+    /// `EDGE_I444_TOP_HAS_RIGHT` for quadrant `quad` (Z-order: 0 = TL,
+    /// 1 = TR, 2 = BL, 3 = BR) under a parent with flag `parent_tr`,
+    /// mirroring dav1d's generated edge tree (`init_mode_node`: TR is
+    /// kept everywhere except BR and a TR child of a TR-less parent).
+    /// Threaded through `partition()` so IntraBC predictor replication
+    /// sees the decoder's exact top-right availability.
+    fn child_top_right(quad: usize, parent_tr: bool) -> bool {
+        !(quad == 3 || (quad == 1 && !parent_tr))
+    }
+
     /// Emit the partition tree. A fully on-screen 32x32 or 64x64 node
     /// whose distinct levels fit the palette (≤4 here — our index tables
     /// only cover sizes 2..4) is coded `NONE` directly; anything else
     /// splits down, with 16x16 (`bw4 == 4`) leaves as before. Offscreen
     /// subtrees emit nothing, and partially on-screen nodes take the
     /// existing edge (split_or / forced-split) path, never `NONE`.
-    fn partition(&mut self, r: usize, c: usize, bw4: usize) {
+    /// `top_has_right` is the decoder edge flag for this node (SB roots
+    /// start set, mirroring the generated tree root).
+    fn partition(&mut self, r: usize, c: usize, bw4: usize, top_has_right: bool) {
         if r >= self.mi_rows || c >= self.mi_cols {
             return;
         }
@@ -427,16 +461,31 @@ impl<'a> TileEncoder<'a> {
             let ctx = self.partition_ctx(r, c, bsl);
             self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
-            self.block(r, c, bsl);
+            self.block(r, c, bsl, top_has_right);
             return;
         }
-        if r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols && self.region_levels(r, c, bw4) <= 4
-        {
-            let ctx = self.partition_ctx(r, c, bsl);
-            self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
-            self.update_partition_ctx(r, c, bsl);
-            self.block(r, c, bsl);
-            return;
+        // Contained nodes: flat regions always take NONE (palette beats a
+        // copy for a single level); with IntraBC off, anything paletteable
+        // (≤4 levels) takes NONE exactly as before; with IntraBC on, a
+        // 2..=4-level region takes NONE only when a copy exists now —
+        // otherwise it splits so children can match at finer grain.
+        // Partially on-screen nodes never take NONE (edge path below).
+        if r + bw4 <= self.mi_rows && c + bw4 <= self.mi_cols {
+            let levels = self.region_levels(r, c, bw4);
+            let take_none = if levels <= 1 {
+                true
+            } else if self.intrabc.is_none() {
+                levels <= 4
+            } else {
+                self.intrabc_match(r, c, bw4, top_has_right).is_some()
+            };
+            if take_none {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.cdfs.part(bsl, ctx).encode(&mut self.sym, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                self.block(r, c, bsl, top_has_right);
+                return;
+            }
         }
         let half = bw4 >> 1;
         let has_rows = r + half < self.mi_rows;
@@ -465,16 +514,48 @@ impl<'a> TileEncoder<'a> {
             self.sym.encode_symbol(1, &[c0, 32768]);
         }
         // Forced SPLIT (neither flag) codes no symbol.
-        self.partition(r, c, half);
-        self.partition(r, c + half, half);
-        self.partition(r + half, c, half);
-        self.partition(r + half, c + half, half);
+        self.partition(r, c, half, Self::child_top_right(0, top_has_right));
+        self.partition(
+            r,
+            c + half,
+            half,
+            Self::child_top_right(1, top_has_right),
+        );
+        self.partition(
+            r + half,
+            c,
+            half,
+            Self::child_top_right(2, top_has_right),
+        );
+        self.partition(
+            r + half,
+            c + half,
+            half,
+            Self::child_top_right(3, top_has_right),
+        );
     }
 
     fn skip_ctx(&self, r: usize, c: usize) -> usize {
         let above = r > 0 && self.skip[(r - 1) * self.mi_cols + c] != 0;
         let left = c > 0 && self.skip[r * self.mi_cols + (c - 1)] != 0;
         usize::from(above) + usize::from(left)
+    }
+
+    /// IntraBC copy available for the `bw4`-MI square at MI `(r, c)` right
+    /// now (deterministic in decoder state, so `partition()` and `block()`
+    /// agree): the decoder-predictor-rooted match search, or `None` when
+    /// disabled. Returns the MV in 1/8-pel units.
+    fn intrabc_match(
+        &self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+    ) -> Option<(i32, i32)> {
+        match self.intrabc.as_ref() {
+            Some(bc) => bc.find_match(self.px, self.w, self.h, r, c, bw4, bw4, top_has_right),
+            None => None,
+        }
     }
 
     /// `get_palette_cache` for luma: sorted dedup merge of the above
@@ -549,21 +630,27 @@ impl<'a> TileEncoder<'a> {
     }
 
     /// Code one block at MI `(r, c)` with size `bsl` (2 ⇒ 16x16, 3 ⇒
-    /// 32x32, 4 ⇒ 64x64): skip + DC + palette + indices. Palette mode is
+    /// 32x32, 4 ⇒ 64x64): skip + DC + palette + indices, or — when
+    /// IntraBC is enabled and an exact causal match exists — an intrabc
+    /// copy (`skip = 1`, integer MV, no residuals). Palette mode is
     /// legal at all three sizes (dav1d gates it on `imax(bw4, bh4) <= 16`
     /// MI); the index tables only cover sizes 2..4, so callers must keep
     /// distinct levels ≤ 4.
-    fn block(&mut self, r: usize, c: usize, bsl: usize) {
+    fn block(&mut self, r: usize, c: usize, bsl: usize, top_has_right: bool) {
         let bw: usize = 4 << bsl;
         let (sx, sy) = (c * 4, r * 4);
+        let bw4 = 1usize << bsl;
 
-        // Palette colors: sorted distinct levels (≤4 for 2-bit content).
+        // Palette colors first: the distinct count doubles as the flat
+        // test (single-level blocks always take the palette path — a copy
+        // can't beat a ~15-bit flat table).
         let mut set = [false; 256];
         for i in 0..bw {
             for j in 0..bw {
                 set[self.sample(sx + j, sy + i) as usize] = true;
             }
         }
+        let distinct = set.iter().filter(|&&b| b).count();
         let mut colors: Vec<u8> = (0..256).filter(|&v| set[v]).map(|v| v as u8).collect();
         assert!(!colors.is_empty() && colors.len() <= 8);
         // A flat block still needs a 2-entry table. Prefer padding with a
@@ -583,6 +670,49 @@ impl<'a> TileEncoder<'a> {
         }
         let psize = colors.len();
 
+        // IntraBC decision (non-flat only): an exact match in causal
+        // decoded area beats the palette path (MV residual of ~10-25 bits
+        // vs palette headers plus indices). Deterministic, so it agrees
+        // with `partition()`'s NONE-vs-SPLIT check above.
+        let bc_mv: Option<(i32, i32)> = if distinct > 1 {
+            self.intrabc_match(r, c, bw4, top_has_right)
+        } else {
+            None
+        };
+
+        // skip = 1 (no residual; reconstruction is exactly the palette
+        // — or the copied pixels on the IntraBC path).
+        let sctx = self.skip_ctx(r, c);
+        self.cdfs.skip[sctx].encode(&mut self.sym, 1);
+
+        if let Some((my, mx)) = bc_mv {
+            // IntraBC copy: flag, then the MV residual against the
+            // decoder's predictor (replicated refmvs search). No mode,
+            // palette, or index symbols; dav1d records DC/empty palette
+            // contexts for neighbours, mirrored in bookkeeping below.
+            let bc = self.intrabc.as_mut().unwrap();
+            bc.flag(&mut self.sym, true);
+            let ((py, px_), _) = bc.predictor(r, c, bw4, bw4, top_has_right);
+            bc.encode_mvd(&mut self.sym, my, mx, py, px_);
+            let n4 = 1usize << bsl;
+            for y in 0..n4 {
+                for x in 0..n4 {
+                    let (rr, cc) = (r + y, c + x);
+                    self.ymode[rr * self.mi_cols + cc] = DC_PRED as u8;
+                    self.skip[rr * self.mi_cols + cc] = 1;
+                    self.psize[rr * self.mi_cols + cc] = 0;
+                }
+            }
+            self.intrabc
+                .as_mut()
+                .unwrap()
+                .record(r, c, bw4, bw4, Some((my, mx)));
+            return;
+        }
+        if self.intrabc.is_some() {
+            self.intrabc.as_mut().unwrap().flag(&mut self.sym, false);
+        }
+
         let mut index_map = vec![0u8; bw * bw];
         for i in 0..bw {
             for j in 0..bw {
@@ -590,10 +720,6 @@ impl<'a> TileEncoder<'a> {
                 index_map[i * bw + j] = colors.binary_search(&v).unwrap_or(0) as u8;
             }
         }
-
-        // skip = 1 (no residual; reconstruction is exactly the palette).
-        let sctx = self.skip_ctx(r, c);
-        self.cdfs.skip[sctx].encode(&mut self.sym, 1);
 
         // y_mode = DC_PRED (all neighbours are DC, so contexts are row 0).
         self.cdfs.y_dc.encode(&mut self.sym, DC_PRED);
@@ -638,16 +764,18 @@ impl<'a> TileEncoder<'a> {
         if n_used < psize {
             self.sym.encode_literal(u32::from(new_colors[0]), 8);
             if new_colors.len() > 1 {
-                // Minimal initial width covering the first delta
-                // (decoder computes bits = 5 + this field).
-                let first_delta = new_colors[1] as u32 - new_colors[0] as u32 - 1;
-                let need = if first_delta == 0 {
-                    1
-                } else {
-                    first_delta.ilog2() + 1
+                // Minimal initial width covering *every* delta in the
+                // chain (decoder widths only shrink, so the maximum
+                // delta dictates a valid — and optimal — start; using
+                // just the first delta truncates a later larger one).
+                let mut need = 1u32;
+                for w in new_colors.windows(2) {
+                    let d = w[1] as u32 - w[0] as u32 - 1;
+                    if d > 0 {
+                        need = need.max(d.ilog2() + 1);
+                    }
                 }
-                .max(5)
-                .min(8);
+                let need = need.max(5).min(8);
                 self.sym.encode_literal(need - 5, 2);
                 let mut palette_bits = need;
                 for k in 1..new_colors.len() {
@@ -679,6 +807,15 @@ impl<'a> TileEncoder<'a> {
                 self.pcolors[rr * self.mi_cols + cc][..psize].copy_from_slice(&colors);
             }
         }
+        // Mirror dav1d's `splat_intraref`: palette blocks contribute no
+        // motion candidate (and mark the footprint decoded for match
+        // search) exactly like the decoder's `rt` grid.
+        if self.intrabc.is_some() {
+            self.intrabc
+                .as_mut()
+                .unwrap()
+                .record(r, c, bw4, bw4, None);
+        }
 
         // color_index_map_y: first index via ns(), rest in wavefront order
         // as positions in the neighbour-derived ColorOrder.
@@ -706,7 +843,9 @@ impl<'a> TileEncoder<'a> {
     fn finish(mut self) -> Vec<u8> {
         for r in (0..self.mi_rows).step_by(16) {
             for c in (0..self.mi_cols).step_by(16) {
-                self.partition(r, c, 16);
+                // SB roots start with top_has_right set, mirroring the
+                // generated edge-tree root (`top_has_right = 1`).
+                self.partition(r, c, 16, true);
             }
         }
         self.sym.finish()
@@ -794,7 +933,11 @@ fn sequence_header_obu(w: u32, h: u32) -> Vec<u8> {
 }
 
 /// Uncompressed frame header bits for our KEY still, then byte-aligned.
-fn frame_header_bits() -> Vec<u8> {
+/// `allow_intrabc` gates the per-block intrabc path (obu.c reads the bit
+/// right here when `allow_screen_content_tools && !superres`); flipping it
+/// changes nothing else (loopfilter/CDEF/restoration sections are already
+/// absent via lossless, delta_q via `base_q_idx == 0`).
+fn frame_header_bits(allow_intrabc: bool) -> Vec<u8> {
     let mut bw = BitWriter::new();
     // (show_existing_frame/frame_type/show_frame implied by reduced header)
     bw.put_bit(0); // disable_cdf_update (CDFs adapt)
@@ -803,8 +946,8 @@ fn frame_header_bits() -> Vec<u8> {
     // frame_size_override implied 0 → dimensions from sequence max.
     // render_and_frame_size_different = 0:
     bw.put_bit(0);
-    // allow_intrabc = 0:
-    bw.put_bit(0);
+    // allow_intrabc:
+    bw.put_bit(u8::from(allow_intrabc));
     // (primary_ref NONE, tile_info, quant, segmentation, deltas,
     //  loopfilter/cdef/lr all implied off by KEY + CodedLossless)
     // tile_info: uniform spacing, single tile (both increments 0):
@@ -835,14 +978,23 @@ fn frame_header_bits() -> Vec<u8> {
 /// OBU wrapping the palette-coded tile data). Returns the payload and the
 /// matching `av1C` body.
 fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> (Vec<u8>, [u8; 4]) {
+    encode_obu_payload_with(gray, w, h, USE_INTRABC)
+}
+
+fn encode_obu_payload_with(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    use_intrabc: bool,
+) -> (Vec<u8>, [u8; 4]) {
     assert_eq!(gray.len(), w as usize * h as usize);
     assert!(w.is_multiple_of(16) && h.is_multiple_of(16));
 
-    let tile = TileEncoder::new(gray, w as usize, h as usize);
+    let tile = TileEncoder::new(gray, w as usize, h as usize, use_intrabc);
     let tile_data = tile.finish();
 
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
-    let mut frame_payload = frame_header_bits();
+    let mut frame_payload = frame_header_bits(use_intrabc);
     // Tile group OBU with a single tile: no header bits, byte-aligned
     // by construction, then the tile data. Together with the frame
     // header this forms an OBU_FRAME (type 6), not OBU_FRAME_HEADER.
@@ -943,4 +1095,42 @@ pub fn encode_gray_pair(
         }],
     };
     write_isobmff(&image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gamut_isobmff::read as read_isobmff;
+
+    /// 8px checkerboard (repetitive enough for IntraBC to trigger).
+    fn checker(w: usize, h: usize) -> Vec<u8> {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| if ((x / 8) + (y / 8)) % 2 == 0 { 0 } else { 255 }))
+            .collect()
+    }
+
+    #[test]
+    fn pair_container_shape() {
+        let small = checker(64, 64);
+        let large = checker(128, 128);
+        let bytes = encode_gray_pair(&small, 64, 64, &large, 128, 128).unwrap();
+        let img = read_isobmff(&bytes).unwrap();
+        assert_eq!(img.primary_item_id, 1);
+        assert_eq!(img.items.len(), 2);
+        assert!(img.items.iter().all(|it| it.item_type == *b"av01"));
+        assert_eq!(img.groups.len(), 1);
+        assert_eq!(img.groups[0].group_type, *b"altr");
+    }
+
+    #[test]
+    fn toggle_changes_output_but_stays_valid_obus() {
+        let gray = checker(64, 64);
+        let (on, _) = encode_obu_payload_with(&gray, 64, 64, true);
+        let (off, _) = encode_obu_payload_with(&gray, 64, 64, false);
+        // Sequence-header OBU first in both streams.
+        assert_eq!(&on[..1], &[0x0a]);
+        assert_eq!(&off[..1], &[0x0a]);
+        // IntraBC fires on repetitive content, so the streams differ.
+        assert_ne!(on, off);
+    }
 }
