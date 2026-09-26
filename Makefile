@@ -7,10 +7,10 @@ LDLIBS += -lpng
 CFLAGS  += -std=gnu99 -Os -ggdb -D__progversion=\"${VERSION_STRING}\" -D__progname=\"${target}\"
 
 #EXTRAS += -fsanitize=undefined -fsanitize=null -fcf-protection=full -fstack-protector-all -fstack-check -Wimplicit-fallthrough -fanalyzer -Wall
-EXTRAS += -fanalyzer -Wall -flto
+EXTRAS += -Wall -flto
 
-CFLAGS += ${EXTRAS}
-LDFLAGS += ${EXTRAS}
+CFLAGS += ${EXTRAS} -I/opt/homebrew/Cellar/libpng/1.6.43/include/libpng16
+LDFLAGS += ${EXTRAS} -L/opt/homebrew/Cellar/libpng/1.6.43/lib
 
 .PHONY: all
 all:	$(target)
