@@ -1146,6 +1146,8 @@ fn tile_params(w: u32, h: u32) -> (u32, u32, u32, u32) {
 }
 
 /// Dimensions this encoder supports: 16-aligned coding grid, non-empty,
+/// at most 65536px per side (sequence header `frame_width_bits_minus_1` /
+/// `frame_height_bits_minus_1` are 4 bits, so at most 16 bits per dimension),
 /// and single-tile feasible with 64px superblocks (i.e. the uniform
 /// `tile_info()` below stays at `TileColsLog2 == TileRowsLog2 == 0`,
 /// so no `context_update_tile_id`/`tile_size_bytes` section exists).
@@ -1160,6 +1162,12 @@ fn check_supported_dimensions(w: u32, h: u32) -> io::Result<()> {
     if w == 0 || h == 0 {
         return Err(invalid_input(format!(
             "dimensions must be non-empty, got {w}x{h}"
+        )));
+    }
+    const MAX_SEQ_DIMENSION: u32 = 65536;
+    if w > MAX_SEQ_DIMENSION || h > MAX_SEQ_DIMENSION {
+        return Err(invalid_input(format!(
+            "dimensions must be at most {MAX_SEQ_DIMENSION}x{MAX_SEQ_DIMENSION}, got {w}x{h}"
         )));
     }
     let (min_cols, _, _, min_tiles) = tile_params(w, h);
@@ -1530,5 +1538,28 @@ mod tests {
         let empty: Vec<u8> = vec![];
         let err = encode_gray(&empty, 0, 0).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn oversized_dimensions_rejected() {
+        use std::io::ErrorKind;
+        // 65552 needs 17 bits, but `frame_width_bits_minus_1` /
+        // `frame_height_bits_minus_1` are 4 bits (max 16 bits per side).
+        // Dimension validation runs before buffer-length checks, so an
+        // empty buffer still exercises the cap.
+        let err = encode_gray(&[], 16, 65552).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("65536"), "unexpected: {err}");
+        let err = encode_gray(&[], 65552, 16).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("65536"), "unexpected: {err}");
+        // The cap is inclusive: 65536 fails later on buffer length, not
+        // on dimensions.
+        let err = encode_gray(&[], 16, 65536).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            !err.to_string().contains("at most"),
+            "boundary 65536 must pass the dimension cap: {err}"
+        );
     }
 }
