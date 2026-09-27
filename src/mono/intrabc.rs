@@ -272,6 +272,49 @@ pub fn reset_uniform_stats() {
 /// Motion vector and predictor in 1/8-pel units.
 type BcMatch = ((i32, i32), (i32, i32));
 
+pub(super) const MOTION_SHORTLIST_MAX: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MatchCandidate {
+    pub(super) ring_rank: u64,
+    pub(super) mv_pred: BcMatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MatchShortlist {
+    pub(super) matches: [Option<MatchCandidate>; MOTION_SHORTLIST_MAX],
+    pub(super) len: usize,
+    /// Candidate source origins checked. Cache lookups count every source
+    /// with the same verified pattern; ring fallbacks count each visited MV.
+    pub(super) probes: u64,
+}
+
+impl MatchShortlist {
+    fn new() -> Self {
+        Self {
+            matches: [None; MOTION_SHORTLIST_MAX],
+            len: 0,
+            probes: 0,
+        }
+    }
+
+    fn push(&mut self, limit: usize, ring_rank: u64, mv_pred: BcMatch) {
+        let insert_at = self.matches[..self.len]
+            .iter()
+            .position(|entry| entry.is_some_and(|present| present.ring_rank > ring_rank))
+            .unwrap_or(self.len);
+        if insert_at >= limit {
+            return;
+        }
+        let new_len = (self.len + 1).min(limit);
+        for index in (insert_at + 1..new_len).rev() {
+            self.matches[index] = self.matches[index - 1];
+        }
+        self.matches[insert_at] = Some(MatchCandidate { ring_rank, mv_pred });
+        self.len = new_len;
+    }
+}
+
 /// Cached-search outcome: definitive (match or true miss) or fallback to
 /// the ring oracle for stripe patterns.
 enum CachedDecision {
@@ -1796,6 +1839,239 @@ impl IntrabcState {
         self.find_match_ring(px, img_w, img_h, r, c, bw4, bh4, top_has_right)
     }
 
+    /// Return up to `limit` legal, exact source matches in the same ring
+    /// order used by `find_match`. The verified 8x cache avoids scanning
+    /// every motion-vector position for ordinary patterns; stripe patterns
+    /// use the ring search so 4px-offset sources remain covered.
+    // Clippy's count is a false positive here: keeping the decoder query's
+    // coordinates and dimensions explicit mirrors `find_match` and makes
+    // its causal bounds visible at every call site.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn find_match_shortlist(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        bh4: usize,
+        top_has_right: bool,
+        limit: usize,
+    ) -> MatchShortlist {
+        let limit = limit.min(MOTION_SHORTLIST_MAX);
+        if limit == 0 {
+            return MatchShortlist::new();
+        }
+        if bw4 == 4
+            && bh4 == 4
+            && self.pattern.verified
+            && self.pattern.w == img_w
+            && self.pattern.h == img_h
+        {
+            if let Some(shortlist) =
+                self.find_match_cached_16_shortlist(px, img_w, img_h, r, c, top_has_right, limit)
+            {
+                return shortlist;
+            }
+        }
+        self.find_match_ring_shortlist(px, img_w, img_h, r, c, bw4, bh4, top_has_right, limit)
+    }
+
+    /// Cached 16x16 multi-match search. `None` requests a ring fallback for
+    /// stripes or unrecognized samples; `Some(empty)` is a definitive miss.
+    // Clippy's count is a false positive here: these are the image and
+    // decoder-state fields already explicit in the single-match kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn find_match_cached_16_shortlist(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        r: usize,
+        c: usize,
+        top_has_right: bool,
+        limit: usize,
+    ) -> Option<MatchShortlist> {
+        let speculative = self.is_speculative();
+        if speculative {
+            PATTERN_QUERIES_SPEC.fetch_add(1, Ordering::Relaxed);
+            self.pattern
+                .spec_queries
+                .set(self.pattern.spec_queries.get() + 1);
+        } else {
+            PATTERN_QUERIES.fetch_add(1, Ordering::Relaxed);
+            self.pattern.queries.set(self.pattern.queries.get() + 1);
+        }
+        let count_fallback = || {
+            if speculative {
+                PATTERN_FALLBACKS_SPEC.fetch_add(1, Ordering::Relaxed);
+                self.pattern
+                    .spec_fallbacks
+                    .set(self.pattern.spec_fallbacks.get() + 1);
+            } else {
+                PATTERN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                self.pattern.fallbacks.set(self.pattern.fallbacks.get() + 1);
+            }
+        };
+
+        let (sx, sy) = (c as i32 * 4, r as i32 * 4);
+        let ((py, px_pred), predictor_ok) = self.predictor(r, c, 4, 4, top_has_right);
+        if !predictor_ok {
+            return Some(MatchShortlist::new());
+        }
+        let sxu = sx as usize;
+        let syu = sy as usize;
+        let (Some(a), Some(b), Some(c0), Some(d)) = (
+            level_to_idx(px[syu * img_w + sxu]),
+            level_to_idx(px[syu * img_w + sxu + 8]),
+            level_to_idx(px[(syu + 8) * img_w + sxu]),
+            level_to_idx(px[(syu + 8) * img_w + sxu + 8]),
+        ) else {
+            count_fallback();
+            return None;
+        };
+        // The cache indexes 8-aligned origins. A 4px-offset copy can match
+        // only horizontal or vertical stripe patterns, which use the ring
+        // oracle to retain those legal origins.
+        if (a == b && c0 == d) || (a == c0 && b == d) {
+            count_fallback();
+            return None;
+        }
+
+        let (sbx, sby) = ((c as i32 / 16) * 64, (r as i32 / 16) * 64);
+        let total_sb64_per_row = (((self.cols as i32 - 1) >> 4) + 1) as i64;
+        let active_sb_row = (sy / 64) as i64;
+        let active_sb64_col = (sx >> 6) as i64;
+        let active_sb64 = active_sb_row * total_sb64_per_row + active_sb64_col;
+        let key = pack_key(a, b, c0, d) as usize;
+        let lo = self.pattern.starts[key] as usize;
+        let hi = self.pattern.starts[key + 1] as usize;
+        let mut shortlist = MatchShortlist::new();
+        for &packed in &self.pattern.positions[lo..hi] {
+            shortlist.probes += 1;
+            let (x0, y0) = ((packed & 0xffff) as i32, (packed >> 16) as i32);
+            let (my, mx) = ((y0 - sy) * 8, (x0 - sx) * 8);
+            if !self.cached_valid(
+                x0,
+                y0,
+                sbx,
+                sby,
+                total_sb64_per_row,
+                active_sb_row,
+                active_sb64,
+                active_sb64_col,
+                my,
+                mx,
+            ) || !self.available(x0, y0, 16, 16, img_w as i32, img_h as i32)
+            {
+                continue;
+            }
+            let (rdx, rdy) = ((mx - px_pred) / 8, (my - py) / 8);
+            if rdx % 4 != 0
+                || rdy % 4 != 0
+                || rdx.abs().max(rdy.abs()) > self.search_radius_rings.max(0) * MATCH_STEP
+            {
+                continue;
+            }
+            let rank = ring_rank(rdx, rdy);
+            shortlist.push(limit, rank, ((my, mx), (py, px_pred)));
+        }
+        Some(shortlist)
+    }
+
+    /// Ring-order search used for generic blocks and the narrow stripe
+    /// fallback. It stops after `limit` exact matches, which are already in
+    /// increasing ring rank.
+    // Clippy's count is a false positive here for the same reason as the
+    // single-match search: each primitive names one part of AV1 query state.
+    #[allow(clippy::too_many_arguments)]
+    fn find_match_ring_shortlist(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        bh4: usize,
+        top_has_right: bool,
+        limit: usize,
+    ) -> MatchShortlist {
+        let mut shortlist = MatchShortlist::new();
+        let (wpx, hpx) = (bw4 as i32 * 4, bh4 as i32 * 4);
+        let (sx, sy) = (c as i32 * 4, r as i32 * 4);
+        let (sbx, sby) = ((c as i32 / 16) * 64, (r as i32 / 16) * 64);
+        let ((py, px_pred), predictor_ok) = self.predictor(r, c, bw4, bh4, top_has_right);
+        if !predictor_ok {
+            return shortlist;
+        }
+        let total_sb64_per_row = (((self.cols as i32 - 1) >> 4) + 1) as i64;
+        let active_sb_row = (sy / 64) as i64;
+        let active_sb64_col = (sx >> 6) as i64;
+        let active_sb64 = active_sb_row * total_sb64_per_row + active_sb64_col;
+        let (sxu, syu) = (sx as usize, sy as usize);
+        let (wpxu, hpxu) = (wpx as usize, hpx as usize);
+        let cur_fp = [
+            px[syu * img_w + sxu],
+            px[syu * img_w + sxu + wpxu - 1],
+            px[(syu + hpxu - 1) * img_w + sxu],
+            px[(syu + hpxu - 1) * img_w + sxu + wpxu - 1],
+            px[(syu + hpxu / 2) * img_w + sxu + wpxu / 2],
+        ];
+        macro_rules! probe {
+            ($my:expr, $mx:expr, $rank:expr) => {{
+                shortlist.probes += 1;
+                if let Some(mv) = self.probe_candidate_at(
+                    px,
+                    img_w,
+                    img_h,
+                    sx,
+                    sy,
+                    wpx,
+                    hpx,
+                    sbx,
+                    sby,
+                    total_sb64_per_row,
+                    active_sb_row,
+                    active_sb64,
+                    active_sb64_col,
+                    cur_fp,
+                    $my,
+                    $mx,
+                ) {
+                    shortlist.push(limit, $rank, (mv, (py, px_pred)));
+                }
+            }};
+        }
+
+        probe!(py, px_pred, 0);
+        if shortlist.len == limit {
+            return shortlist;
+        }
+        for k in 1..=self.search_radius_rings {
+            let step = k * MATCH_STEP;
+            for i in -k..=k {
+                let offset = i * MATCH_STEP;
+                for (dx, dy) in [(offset, -step), (offset, step)] {
+                    probe!(py + dy * 8, px_pred + dx * 8, ring_rank(dx, dy));
+                    if shortlist.len == limit {
+                        return shortlist;
+                    }
+                }
+                if i != -k && i != k {
+                    for (dx, dy) in [(-step, offset), (step, offset)] {
+                        probe!(py + dy * 8, px_pred + dx * 8, ring_rank(dx, dy));
+                        if shortlist.len == limit {
+                            return shortlist;
+                        }
+                    }
+                }
+            }
+        }
+        shortlist
+    }
+
     /// Cached 16x16 search on verified 8x images. Returns definitive (match
     /// or true miss) or fallback to the ring search (stripe patterns where
     /// a 4px-offset source could match). No per-query allocation and no
@@ -2113,6 +2389,27 @@ mod tests {
         (n, hc, hr, fb as usize, saw_4offset)
     }
 
+    fn state_before_query(
+        px: &[u8],
+        w: usize,
+        h: usize,
+        target_x: usize,
+        target_y: usize,
+    ) -> IntrabcState {
+        let mut state = state_for(px, w, h);
+        for y in (0..=target_y).step_by(16) {
+            for x in (0..w).step_by(16) {
+                if (x, y) == (target_x, target_y) {
+                    return state;
+                }
+                let (r, c) = (y / 4, x / 4);
+                let matched = state.find_match(px, w, h, r, c, 4, 4, true);
+                state.record(r, c, 4, 4, matched.map(|((my, mx), _)| (my, mx)));
+            }
+        }
+        panic!("query target ({target_x},{target_y}) was not visited");
+    }
+
     #[test]
     fn ring_rank_matches_iteration_order() {
         // Reproduce the ring loop order and require strictly increasing rank.
@@ -2135,6 +2432,61 @@ mod tests {
                         prev = rank;
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_top_eight_matches_ring_oracle_for_patterns_and_stripes() {
+        let (sw, sh) = (32, 32);
+        let target = (192, 192);
+        for stripe in [false, true] {
+            let mut src = vec![0u8; sw * sh];
+            for y in 0..sh {
+                for x in 0..sw {
+                    src[y * sw + x] = if stripe {
+                        (y % 2) as u8
+                    } else {
+                        match (x % 2, y % 2) {
+                            (0, 0) => 0,
+                            (1, 0) => 1,
+                            (0, 1) => 2,
+                            _ => 3,
+                        }
+                    };
+                }
+            }
+            let (px, w, h) = upscale_from_indices(&src, sw, sh);
+            let state = state_before_query(&px, w, h, target.0, target.1);
+            let (r, c) = (target.1 / 4, target.0 / 4);
+            let cached = state.find_match_shortlist(&px, w, h, r, c, 4, 4, true, 8);
+            let ring = state.find_match_ring_shortlist(&px, w, h, r, c, 4, 4, true, 8);
+            assert_eq!(
+                cached.len, ring.len,
+                "shortlist lengths differ; stripe={stripe}"
+            );
+            assert_eq!(
+                cached.matches[..cached.len],
+                ring.matches[..ring.len],
+                "cached and ring shortlist differ; stripe={stripe}"
+            );
+            assert_eq!(
+                cached.len, 8,
+                "fixture should expose eight matches; stripe={stripe}"
+            );
+            assert_eq!(
+                cached.matches[0].map(|candidate| candidate.mv_pred),
+                state.find_match(&px, w, h, r, c, 4, 4, true),
+                "first shortlisted match must preserve the existing search; stripe={stripe}"
+            );
+            assert!(cached.matches[..cached.len]
+                .windows(2)
+                .all(|pair| pair[0].unwrap().ring_rank < pair[1].unwrap().ring_rank));
+            if stripe {
+                assert!(
+                    state.pattern_fallbacks() > 0,
+                    "stripe must use ring fallback"
+                );
             }
         }
     }

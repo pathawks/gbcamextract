@@ -6,7 +6,8 @@ Extracts photos from Game Boy Camera / Pocket Camera saves. Frames can be preser
 ## Usage
 
 ```console
-gbcamextract [-r rom.gb] [--flat-pad-policy baseline|lookahead] -s save.sav
+gbcamextract [-r rom.gb] [--flat-pad-policy baseline|lookahead] \
+  [--motion-candidate first-match|top-k8] -s save.sav
 ```
 
 This will produce 30 AVIF files containing your photos. It is optional to specify the rom; this will allow the picture frames to be extracted too.
@@ -36,6 +37,14 @@ Set `GBCAMEXTRACT_RDO_STATS=1` to print per-output and process-wide RDO,
 IntraBC search, fallback, selection, error, and uniform-cache memory counts.
 Per-output deltas are reported with a one-thread Rayon pool; aggregate counts
 are reported at any thread count.
+
+`--motion-candidate top-k8` is an opt-in lossless search candidate for the
+large raster's RDO path. On nonuniform 16x16 blocks in a verified 8x image,
+it prices up to eight legal exact IntraBC copies from the same incoming
+coding state and emits the lowest-cost copy when it beats palette coding.
+Every copy has zero residual. The default `first-match` policy preserves the
+existing search. With `GBCAMEXTRACT_RDO_STATS=1`, motion shortlist probes,
+priced matches, and committed alternate-match selections are reported.
 
 Flat palette blocks keep the current padding rule by default. The optional
 `--flat-pad-policy lookahead` mode tests the existing pad, cached colors, and

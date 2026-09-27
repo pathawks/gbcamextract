@@ -41,7 +41,7 @@ use std::ops::{Deref, DerefMut};
 
 mod intrabc;
 pub use intrabc::UniformSearchStats;
-use intrabc::{IntrabcState, MvComp, MvRec, UniformDecision};
+use intrabc::{IntrabcState, MatchShortlist, MvComp, MvRec, UniformDecision, MOTION_SHORTLIST_MAX};
 
 const DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS: i32 = 0;
 
@@ -109,6 +109,64 @@ pub enum FlatPadPolicy {
     #[default]
     Baseline,
     Lookahead,
+}
+
+/// Search policy for exact IntraBC copies in the RDO path.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub enum MotionCandidatePolicy {
+    /// Preserve the historical first legal ring match.
+    #[default]
+    FirstMatch,
+    /// Price the eight nearest legal exact matches independently.
+    TopK8,
+}
+
+/// Work and selected alternatives for the opt-in multi-match policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MotionCandidateStats {
+    /// Nonuniform 16x16 shortlist searches, including nested RDO trials.
+    pub shortlist_searches: u64,
+    /// Source positions checked by the pattern index or ring fallback.
+    pub source_probes: u64,
+    /// Exact matches priced in separate state-isolated RDO trials.
+    pub priced_matches: u64,
+    /// Committed leaves selecting a match after the first ring-ranked match.
+    pub alternate_choices: u64,
+    /// Sum of selected zero-based shortlist indices for alternate choices.
+    pub alternate_index_sum: u64,
+}
+
+static MOTION_SHORTLIST_SEARCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MOTION_SOURCE_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MOTION_PRICED_MATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MOTION_ALTERNATE_CHOICES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MOTION_ALTERNATE_INDEX_SUM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read process-wide TopK8 work and selection counters.
+#[allow(dead_code)]
+pub fn motion_candidate_stats() -> MotionCandidateStats {
+    use std::sync::atomic::Ordering;
+    MotionCandidateStats {
+        shortlist_searches: MOTION_SHORTLIST_SEARCHES.load(Ordering::Relaxed),
+        source_probes: MOTION_SOURCE_PROBES.load(Ordering::Relaxed),
+        priced_matches: MOTION_PRICED_MATCHES.load(Ordering::Relaxed),
+        alternate_choices: MOTION_ALTERNATE_CHOICES.load(Ordering::Relaxed),
+        alternate_index_sum: MOTION_ALTERNATE_INDEX_SUM.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset process-wide TopK8 diagnostics.
+#[allow(dead_code)]
+pub fn reset_motion_candidate_stats() {
+    use std::sync::atomic::Ordering;
+    MOTION_SHORTLIST_SEARCHES.store(0, Ordering::Relaxed);
+    MOTION_SOURCE_PROBES.store(0, Ordering::Relaxed);
+    MOTION_PRICED_MATCHES.store(0, Ordering::Relaxed);
+    MOTION_ALTERNATE_CHOICES.store(0, Ordering::Relaxed);
+    MOTION_ALTERNATE_INDEX_SUM.store(0, Ordering::Relaxed);
 }
 
 /// Work and outcomes of the opt-in flat-pad search. Counts include searches
@@ -223,14 +281,29 @@ pub fn reset_rdo_stats() {
     BASELINE_WINS.store(0, Ordering::Relaxed);
     RDO_CANDIDATES.store(0, Ordering::Relaxed);
     RDO_ERRORS.store(0, Ordering::Relaxed);
+    reset_motion_candidate_stats();
 }
 
 /// Motion-vector pair and predictor in 1/8-pel units (matches
 /// `intrabc::BcMatch` shape without exposing its private type).
 type MvPair = (i32, i32);
 type BcMatch = (MvPair, MvPair);
-/// Estimated cost plus the copy MV/predictor it was measured with.
 type CopyCost = (f64, BcMatch, bool);
+type MotionSearchResult = (
+    [Option<(BcMatch, bool, usize)>; MOTION_SHORTLIST_MAX],
+    usize,
+    bool,
+);
+
+/// Estimated cost plus the selected copy and its ring-order index for a
+/// 16x16 shortlist decision.
+#[derive(Clone, Copy, Debug)]
+struct RankedCopyCost {
+    cost: f64,
+    mv_pred: BcMatch,
+    uniform: bool,
+    shortlist_index: usize,
+}
 
 #[derive(Clone, Copy)]
 struct BlockContext {
@@ -949,6 +1022,9 @@ struct TileEncoder<'a> {
     /// Flat-block unused palette entry policy. Defaults to the historical
     /// cached-color/fallback rule.
     flat_pad_policy: FlatPadPolicy,
+    /// Opt-in multi-match pricing. The default preserves the first-match
+    /// candidate sequence and output byte-for-byte.
+    motion_candidate_policy: MotionCandidatePolicy,
     /// Trial scoring for a non-RDO palette path also needs the same
     /// fractional-bit accounting as RDO, without changing its decisions.
     pad_scoring: bool,
@@ -1035,6 +1111,35 @@ impl<'a> TileEncoder<'a> {
         search_radius_rings: i32,
         uniform_search_radius_rings: i32,
     ) -> io::Result<Self> {
+        Self::new_with_rdo_pad_and_motion_policy(
+            px,
+            w,
+            h,
+            use_intrabc,
+            src_masks,
+            use_rdo,
+            flat_pad_policy,
+            search_radius_rings,
+            uniform_search_radius_rings,
+            MotionCandidatePolicy::FirstMatch,
+        )
+    }
+
+    // Clippy's count is a false positive here: the constructor keeps the
+    // input geometry, coding switches, and search controls explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_rdo_pad_and_motion_policy(
+        px: &'a [u8],
+        w: usize,
+        h: usize,
+        use_intrabc: bool,
+        src_masks: Option<Vec<u8>>,
+        use_rdo: bool,
+        flat_pad_policy: FlatPadPolicy,
+        search_radius_rings: i32,
+        uniform_search_radius_rings: i32,
+        motion_candidate_policy: MotionCandidatePolicy,
+    ) -> io::Result<Self> {
         if w > u32::MAX as usize || h > u32::MAX as usize {
             return Err(invalid_input(format!(
                 "dimensions exceed u32 range, got {w}x{h}"
@@ -1100,6 +1205,7 @@ impl<'a> TileEncoder<'a> {
             use_rdo,
             cost_only: false,
             flat_pad_policy,
+            motion_candidate_policy,
             pad_scoring: false,
             pad_preview_depth: 0,
             flat_pad_stats: FlatPadStats::default(),
@@ -1439,6 +1545,29 @@ impl<'a> TileEncoder<'a> {
             Some(bc) => bc.find_match(self.px, self.w, self.h, r, c, bw4, bw4, top_has_right),
             None => None,
         }
+    }
+
+    fn intrabc_match_shortlist(
+        &self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+        limit: usize,
+    ) -> Option<MatchShortlist> {
+        self.intrabc.as_ref().map(|bc| {
+            bc.find_match_shortlist(
+                self.px,
+                self.w,
+                self.h,
+                r,
+                c,
+                bw4,
+                bw4,
+                top_has_right,
+                limit,
+            )
+        })
     }
 
     /// Uniform 16x16 lookup has its own exact-byte spatial index. A
@@ -2505,49 +2634,102 @@ impl<'a> TileEncoder<'a> {
         } else {
             None
         };
-        // Use the exact-byte cache for actual uniform blocks; all other
-        // blocks retain the existing nonuniform search behavior.
-        let copy_trial: Option<CopyCost> = {
+        // Uniform blocks keep their existing exact-byte lookup. The TopK8
+        // candidate is limited to nonuniform 16x16 leaves; every match is
+        // priced from an identical incoming state before one is replayed.
+        const EPS: f64 = 1e-9;
+        let best_copy: Option<RankedCopyCost> = {
             let outer_depth = self.speculative_depth();
             self.enter_speculative();
-            let searched = (|| -> io::Result<(Option<BcMatch>, bool)> {
+            let searched = (|| -> io::Result<MotionSearchResult> {
+                let mut candidates = [None; MOTION_SHORTLIST_MAX];
+                let mut candidate_count = 0;
+                let mut used_shortlist = false;
                 match self.intrabc_uniform_match(r, c, bw4, top_has_right)? {
-                    UniformDecision::Uniform(m) => Ok((m, true)),
-                    UniformDecision::NotUniform => {
-                        Ok((self.intrabc_match(r, c, bw4, top_has_right), false))
+                    UniformDecision::Uniform(Some(mv_pred)) => {
+                        candidates[0] = Some((mv_pred, true, 0));
+                        candidate_count = 1;
                     }
+                    UniformDecision::Uniform(None) => {}
+                    UniformDecision::NotUniform => match self.motion_candidate_policy {
+                        MotionCandidatePolicy::FirstMatch => {
+                            if let Some(mv_pred) = self.intrabc_match(r, c, bw4, top_has_right) {
+                                candidates[0] = Some((mv_pred, false, 0));
+                                candidate_count = 1;
+                            }
+                        }
+                        MotionCandidatePolicy::TopK8 => {
+                            used_shortlist = true;
+                            let shortlist = self
+                                .intrabc_match_shortlist(
+                                    r,
+                                    c,
+                                    bw4,
+                                    top_has_right,
+                                    MOTION_SHORTLIST_MAX,
+                                )
+                                .expect("IntraBC state checked before shortlist search");
+                            use std::sync::atomic::Ordering;
+                            MOTION_SHORTLIST_SEARCHES.fetch_add(1, Ordering::Relaxed);
+                            MOTION_SOURCE_PROBES.fetch_add(shortlist.probes, Ordering::Relaxed);
+                            for (index, candidate_slot) in
+                                candidates.iter_mut().enumerate().take(shortlist.len)
+                            {
+                                let candidate = shortlist.matches[index]
+                                    .expect("shortlist entries are contiguous");
+                                *candidate_slot = Some((candidate.mv_pred, false, index));
+                            }
+                            candidate_count = shortlist.len;
+                        }
+                    },
                 }
+                Ok((candidates, candidate_count, used_shortlist))
             })();
             self.restore_speculative(outer_depth);
-            let (m, is_uniform) = searched?;
-            match m {
-                None => None,
-                Some(mv_pred) => {
-                    let cost = self.trial(r, c, bw4, bw4, |enc| {
-                        let ctx = enc.partition_ctx(r, c, bsl);
-                        enc.enc_part(bsl, ctx, PARTITION_NONE);
-                        enc.update_partition_ctx(r, c, bsl);
-                        let sctx = enc.skip_ctx(r, c);
-                        enc.enc_skip(sctx, 1);
-                        enc.encode_copy(
-                            r,
-                            c,
-                            bsl,
-                            bw4,
-                            mv_pred.0 .0,
-                            mv_pred.0 .1,
-                            mv_pred.1 .0,
-                            mv_pred.1 .1,
-                        )
-                    })?;
-                    Some((cost, mv_pred, is_uniform))
+            let (candidates, candidate_count, used_shortlist) = searched?;
+            let mut best: Option<RankedCopyCost> = None;
+            for (index, candidate) in candidates[..candidate_count].iter().enumerate() {
+                let (mv_pred, uniform, shortlist_index) =
+                    candidate.expect("candidate entries are contiguous");
+                if used_shortlist {
+                    MOTION_PRICED_MATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let cost = self.trial(r, c, bw4, bw4, |enc| {
+                    let ctx = enc.partition_ctx(r, c, bsl);
+                    enc.enc_part(bsl, ctx, PARTITION_NONE);
+                    enc.update_partition_ctx(r, c, bsl);
+                    let sctx = enc.skip_ctx(r, c);
+                    enc.enc_skip(sctx, 1);
+                    enc.encode_copy(
+                        r,
+                        c,
+                        bsl,
+                        bw4,
+                        mv_pred.0 .0,
+                        mv_pred.0 .1,
+                        mv_pred.1 .0,
+                        mv_pred.1 .1,
+                    )
+                })?;
+                let priced = RankedCopyCost {
+                    cost,
+                    mv_pred,
+                    uniform,
+                    shortlist_index: if used_shortlist {
+                        index
+                    } else {
+                        shortlist_index
+                    },
+                };
+                if best.is_none_or(|incumbent| cost < incumbent.cost - EPS) {
+                    best = Some(priced);
                 }
             }
+            best
         };
         // Decide (tie → palette, earliest in order, deterministic).
-        const EPS: f64 = 1e-9;
-        let use_palette = match (pal_cost, copy_trial) {
-            (Some(pc), Some((cc, _, _))) => cc >= pc - EPS,
+        let use_palette = match (pal_cost, best_copy) {
+            (Some(pc), Some(copy)) => copy.cost >= pc - EPS,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => {
@@ -2574,7 +2756,19 @@ impl<'a> TileEncoder<'a> {
                 plan.push(PlanDecision::Palette);
             }
         } else {
-            let (_, mv_pred, uniform_copy) = copy_trial.expect("copy must exist when chosen");
+            let selected = best_copy.expect("copy must exist when chosen");
+            let mv_pred = selected.mv_pred;
+            let uniform_copy = selected.uniform;
+            if !self.cost_only
+                && self.motion_candidate_policy == MotionCandidatePolicy::TopK8
+                && !uniform_copy
+                && selected.shortlist_index > 0
+            {
+                use std::sync::atomic::Ordering;
+                MOTION_ALTERNATE_CHOICES.fetch_add(1, Ordering::Relaxed);
+                MOTION_ALTERNATE_INDEX_SUM
+                    .fetch_add(selected.shortlist_index as u64, Ordering::Relaxed);
+            }
             let ctx = self.partition_ctx(r, c, bsl);
             self.enc_part(bsl, ctx, PARTITION_NONE);
             self.update_partition_ctx(r, c, bsl);
@@ -3542,6 +3736,7 @@ fn encode_obu_payload_with_rdo(
     )
 }
 
+#[cfg(test)]
 fn encode_obu_payload_with_rdo_and_pad_policy(
     gray: &[u8],
     w: u32,
@@ -3551,8 +3746,33 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
     search_radius_rings: i32,
     uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_with_rdo_pad_and_motion_policy(
+        gray,
+        w,
+        h,
+        use_intrabc,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+        MotionCandidatePolicy::FirstMatch,
+    )
+}
+
+// Clippy's count is a false positive here: this internal bridge carries the
+// same encoder controls as its existing RDO entry point plus one policy.
+#[allow(clippy::too_many_arguments)]
+fn encode_obu_payload_with_rdo_pad_and_motion_policy(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    use_intrabc: bool,
+    flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+    motion_candidate_policy: MotionCandidatePolicy,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
-    let tile = TileEncoder::new_with_rdo_and_pad_policy(
+    let tile = TileEncoder::new_with_rdo_pad_and_motion_policy(
         gray,
         w as usize,
         h as usize,
@@ -3562,6 +3782,7 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
         flat_pad_policy,
         search_radius_rings,
         uniform_search_radius_rings,
+        motion_candidate_policy,
     )?;
     let tile_data = tile.finish()?;
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
@@ -3603,8 +3824,28 @@ fn encode_obu_payload_rdo_with_policy(
     search_radius_rings: i32,
     uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_rdo_with_policy_and_motion(
+        gray,
+        w,
+        h,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+        MotionCandidatePolicy::FirstMatch,
+    )
+}
+
+fn encode_obu_payload_rdo_with_policy_and_motion(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+    motion_candidate_policy: MotionCandidatePolicy,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
-        return encode_obu_payload_with_rdo_and_pad_policy(
+        return encode_obu_payload_with_rdo_pad_and_motion_policy(
             gray,
             w,
             h,
@@ -3612,9 +3853,10 @@ fn encode_obu_payload_rdo_with_policy(
             flat_pad_policy,
             search_radius_rings,
             uniform_search_radius_rings,
+            motion_candidate_policy,
         );
     }
-    encode_obu_payload_with_rdo_and_pad_policy(
+    encode_obu_payload_with_rdo_pad_and_motion_policy(
         gray,
         w,
         h,
@@ -3622,6 +3864,7 @@ fn encode_obu_payload_rdo_with_policy(
         flat_pad_policy,
         search_radius_rings,
         uniform_search_radius_rings,
+        motion_candidate_policy,
     )
 }
 
@@ -3820,6 +4063,38 @@ pub fn encode_gray_pair_with_pad_policy(
     search_radius_rings: i32,
     uniform_search_radius_rings: i32,
 ) -> io::Result<Vec<u8>> {
+    encode_gray_pair_with_pad_policy_and_motion_candidate(
+        small,
+        sw,
+        sh,
+        large,
+        lw,
+        lh,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+        MotionCandidatePolicy::FirstMatch,
+    )
+}
+
+/// `encode_gray_pair_with_pad_policy` with an opt-in motion-copy candidate
+/// policy for the large (normally 8x) raster's RDO encode. The first-match
+/// policy leaves the historical candidate path unchanged.
+// Clippy's count is a false positive here: this public convenience function
+// intentionally mirrors the existing pair API and adds its policy argument.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gray_pair_with_pad_policy_and_motion_candidate(
+    small: &[u8],
+    sw: u32,
+    sh: u32,
+    large: &[u8],
+    lw: u32,
+    lh: u32,
+    flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+    motion_candidate_policy: MotionCandidatePolicy,
+) -> io::Result<Vec<u8>> {
     let base_small = encode_obu_payload_with_policy(
         small,
         sw,
@@ -3854,13 +4129,14 @@ pub fn encode_gray_pair_with_pad_policy(
             None
         }
     };
-    let rdo_large = match encode_obu_payload_rdo_with_policy(
+    let rdo_large = match encode_obu_payload_rdo_with_policy_and_motion(
         large,
         lw,
         lh,
         flat_pad_policy,
         search_radius_rings,
         uniform_search_radius_rings,
+        motion_candidate_policy,
     ) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
@@ -5169,6 +5445,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn top_k_motion_candidate_preserves_first_match_control_and_is_deterministic() {
+        let (sw, sh) = (32usize, 32usize);
+        let mut small = vec![0u8; sw * sh];
+        for y in 0..sh {
+            for x in 0..sw {
+                small[y * sw + x] = match (x % 2, y % 2) {
+                    (0, 0) => 0,
+                    (1, 0) => 85,
+                    (0, 1) => 170,
+                    _ => 255,
+                };
+            }
+        }
+        let (lw, lh) = (sw * 8, sh * 8);
+        let mut large = vec![0u8; lw * lh];
+        for y in 0..sh {
+            for x in 0..sw {
+                let value = small[y * sw + x];
+                for dy in 0..8 {
+                    let start = (y * 8 + dy) * lw + x * 8;
+                    large[start..start + 8].fill(value);
+                }
+            }
+        }
+        let baseline = encode_obu_payload_rdo_with_policy(
+            &large,
+            lw as u32,
+            lh as u32,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let explicit_control = encode_obu_payload_rdo_with_policy_and_motion(
+            &large,
+            lw as u32,
+            lh as u32,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+        )
+        .unwrap();
+        assert_eq!(baseline, explicit_control);
+
+        let candidate = encode_obu_payload_rdo_with_policy_and_motion(
+            &large,
+            lw as u32,
+            lh as u32,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::TopK8,
+        )
+        .unwrap();
+        let repeated = encode_obu_payload_rdo_with_policy_and_motion(
+            &large,
+            lw as u32,
+            lh as u32,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::TopK8,
+        )
+        .unwrap();
+        assert_eq!(candidate, repeated, "TopK8 must be deterministic");
+    }
+
     /// Available copy loses to palette coding: repeated 16px patterns where
     /// whole-block copies exist (later SBs) but MV residuals plus flags cost
     /// more than small palettes. Baseline intrabc-enabled takes the copies
@@ -5792,8 +6137,9 @@ mod tests {
         let _ = (w2, b2);
     }
 
-    /// Decode both image items via ffmpeg (when available) and compare native
-    /// grayscale samples exactly. Skips gracefully when ffmpeg is missing.
+    /// Decode both image items via ffmpeg and the TopK8 primary through
+    /// libavif's dav1d and libaom backends. Skips gracefully when ffmpeg is
+    /// missing.
     /// Manual run: `cargo test --release rdo_decode_verify -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -5824,15 +6170,17 @@ mod tests {
                 large[y * 1280 + x] = small[(y / 8) * w + (x / 8)];
             }
         }
-        let avif = encode_gray_pair_with_search_radii(
+        let avif = encode_gray_pair_with_pad_policy_and_motion_candidate(
             &small,
             160,
             144,
             &large,
             1280,
             1152,
+            FlatPadPolicy::Baseline,
             intrabc::DEFAULT_SEARCH_RINGS,
             DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::TopK8,
         )
         .unwrap();
         let dir = std::env::temp_dir().join(format!("rdo_verify_{}", std::process::id()));
@@ -5865,6 +6213,34 @@ mod tests {
             let raw = std::fs::read(&raw_path).unwrap();
             assert_eq!(raw.len(), ew * eh, "stream {stream} size");
             assert_eq!(raw, *expect, "stream {stream} lossless pixels");
+        }
+        if Command::new("avifdec").arg("-V").output().is_ok() {
+            for codec in ["dav1d", "aom"] {
+                let y4m_path = dir.join(format!("topk-{codec}.y4m"));
+                let status = Command::new("avifdec")
+                    .args(["--codec", codec])
+                    .arg(&avif_path)
+                    .arg(&y4m_path)
+                    .status()
+                    .expect("avifdec run");
+                assert!(status.success(), "avifdec {codec} decode");
+                let y4m = std::fs::read(&y4m_path).unwrap();
+                let header_end = y4m.iter().position(|&byte| byte == b'\n').unwrap();
+                let header = String::from_utf8_lossy(&y4m[..header_end]);
+                assert!(header.contains("W1280") && header.contains("H1152"));
+                let frame_start = y4m[header_end + 1..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map(|offset| header_end + 2 + offset)
+                    .unwrap();
+                let luma_end = frame_start + 1280 * 1152;
+                assert!(y4m.len() >= luma_end, "short Y4M output from {codec}");
+                assert_eq!(
+                    &y4m[frame_start..luma_end],
+                    large.as_slice(),
+                    "TopK8 primary item differs through {codec}"
+                );
+            }
         }
         std::fs::remove_dir_all(&dir).ok();
     }
