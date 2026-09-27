@@ -98,6 +98,85 @@ pub fn reset_pattern_cache_stats() {
 /// header bit).
 pub const USE_INTRABC: bool = true;
 
+/// Flat-block pad selection policy. `Baseline` preserves the historical
+/// cached-color-then-adjacent-value choice. `Lookahead` evaluates that choice
+/// plus available gray levels by replaying the current flat block and one
+/// upcoming sibling subtree with fractional-bit costs.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub enum FlatPadPolicy {
+    #[default]
+    Baseline,
+    Lookahead,
+}
+
+/// Work and outcomes of the opt-in flat-pad search. Counts include searches
+/// inside speculative RDO branches; those trials are real added encoding work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlatPadStats {
+    /// Flat palette blocks on committed (non-cost-only) encoder passes.
+    pub committed_flat_blocks: u64,
+    pub searches: u64,
+    pub candidate_trials: u64,
+    pub preview_nodes: u64,
+    pub baseline_wins: u64,
+    pub lookahead_wins: u64,
+    pub ties: u64,
+    pub errors: u64,
+}
+
+static FLAT_PAD_SEARCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_COMMITTED_BLOCKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_CANDIDATE_TRIALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_PREVIEW_NODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_BASELINE_WINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_LOOKAHEAD_WINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_TIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLAT_PAD_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read process-wide flat-pad search counters.
+#[allow(dead_code)]
+pub fn flat_pad_stats() -> FlatPadStats {
+    use std::sync::atomic::Ordering;
+    FlatPadStats {
+        committed_flat_blocks: FLAT_PAD_COMMITTED_BLOCKS.load(Ordering::Relaxed),
+        searches: FLAT_PAD_SEARCHES.load(Ordering::Relaxed),
+        candidate_trials: FLAT_PAD_CANDIDATE_TRIALS.load(Ordering::Relaxed),
+        preview_nodes: FLAT_PAD_PREVIEW_NODES.load(Ordering::Relaxed),
+        baseline_wins: FLAT_PAD_BASELINE_WINS.load(Ordering::Relaxed),
+        lookahead_wins: FLAT_PAD_LOOKAHEAD_WINS.load(Ordering::Relaxed),
+        ties: FLAT_PAD_TIES.load(Ordering::Relaxed),
+        errors: FLAT_PAD_ERRORS.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset process-wide flat-pad search counters.
+#[allow(dead_code)]
+pub fn reset_flat_pad_stats() {
+    use std::sync::atomic::Ordering;
+    FLAT_PAD_SEARCHES.store(0, Ordering::Relaxed);
+    FLAT_PAD_COMMITTED_BLOCKS.store(0, Ordering::Relaxed);
+    FLAT_PAD_CANDIDATE_TRIALS.store(0, Ordering::Relaxed);
+    FLAT_PAD_PREVIEW_NODES.store(0, Ordering::Relaxed);
+    FLAT_PAD_BASELINE_WINS.store(0, Ordering::Relaxed);
+    FLAT_PAD_LOOKAHEAD_WINS.store(0, Ordering::Relaxed);
+    FLAT_PAD_TIES.store(0, Ordering::Relaxed);
+    FLAT_PAD_ERRORS.store(0, Ordering::Relaxed);
+}
+
+fn merge_flat_pad_stats(stats: FlatPadStats) {
+    use std::sync::atomic::Ordering;
+    FLAT_PAD_SEARCHES.fetch_add(stats.searches, Ordering::Relaxed);
+    FLAT_PAD_COMMITTED_BLOCKS.fetch_add(stats.committed_flat_blocks, Ordering::Relaxed);
+    FLAT_PAD_CANDIDATE_TRIALS.fetch_add(stats.candidate_trials, Ordering::Relaxed);
+    FLAT_PAD_PREVIEW_NODES.fetch_add(stats.preview_nodes, Ordering::Relaxed);
+    FLAT_PAD_BASELINE_WINS.fetch_add(stats.baseline_wins, Ordering::Relaxed);
+    FLAT_PAD_LOOKAHEAD_WINS.fetch_add(stats.lookahead_wins, Ordering::Relaxed);
+    FLAT_PAD_TIES.fetch_add(stats.ties, Ordering::Relaxed);
+    FLAT_PAD_ERRORS.fetch_add(stats.errors, Ordering::Relaxed);
+}
+
 /// Whole-image RDO-vs-baseline fallback diagnostics (process-global,
 /// Rayon-safe; reset per measurement). `RDO_WINS` counts complete AVIF
 /// files where the cost-based strategy was smaller; `BASELINE_WINS` counts
@@ -150,6 +229,27 @@ type MvPair = (i32, i32);
 type BcMatch = (MvPair, MvPair);
 /// Estimated cost plus the copy MV/predictor it was measured with.
 type CopyCost = (f64, BcMatch, bool);
+
+#[derive(Clone, Copy)]
+struct BlockContext {
+    r: usize,
+    c: usize,
+    bsl: usize,
+    top_has_right: bool,
+    carried: Option<BcMatch>,
+    force_palette: bool,
+}
+
+struct FlatPadLookahead<'a> {
+    r: usize,
+    c: usize,
+    bsl: usize,
+    top_has_right: bool,
+    force_palette: bool,
+    used: u8,
+    baseline_pad: u8,
+    cache: &'a [u8],
+}
 
 /// A 64x64 superblock's contained partition tree has at most 21 nodes
 /// (64, four 32s, sixteen 16s). Plans are stack-bounded and live only for
@@ -825,6 +925,10 @@ struct TileEncoder<'a> {
     /// `GAME_SHADES`): one 4-bit mask per 16x16 region, row-major.
     src_masks: Option<Vec<u8>>,
     mask_w16: usize,
+    /// Sorted unique grayscale samples from this effective rendered image.
+    /// Used only to form the opt-in flat-pad candidate set.
+    global_colors: [u8; 256],
+    global_color_len: usize,
     /// Fractional-bit cost estimate accumulated alongside encoding (see
     /// `adapt_bits`). Saved/restored around RDO trials; the delta over a
     /// trial is the candidate's estimated cost. Committed-path value is
@@ -840,6 +944,17 @@ struct TileEncoder<'a> {
     /// RDO trials need adapted CDFs and fractional costs, but not arithmetic
     /// output. Keeping trials cost-only avoids cloning the growing coder.
     cost_only: bool,
+    /// Flat-block unused palette entry policy. Defaults to the historical
+    /// cached-color/fallback rule.
+    flat_pad_policy: FlatPadPolicy,
+    /// Trial scoring for a non-RDO palette path also needs the same
+    /// fractional-bit accounting as RDO, without changing its decisions.
+    pad_scoring: bool,
+    /// A look-ahead preview uses the historical policy for its one-sibling
+    /// horizon, so previews never recursively start more previews.
+    pad_preview_depth: u8,
+    /// Search counters deliberately persist across rejected trials.
+    flat_pad_stats: FlatPadStats,
 }
 
 /// `Partition_Context` update table (§5.11.4), rows [above|left],
@@ -873,6 +988,7 @@ struct Snapshot {
 }
 
 impl<'a> TileEncoder<'a> {
+    #[cfg(test)]
     fn new(
         px: &'a [u8],
         w: usize,
@@ -883,6 +999,7 @@ impl<'a> TileEncoder<'a> {
         Self::new_with_rdo(px, w, h, use_intrabc, src_masks, false)
     }
 
+    #[cfg(test)]
     fn new_with_rdo(
         px: &'a [u8],
         w: usize,
@@ -890,6 +1007,26 @@ impl<'a> TileEncoder<'a> {
         use_intrabc: bool,
         src_masks: Option<Vec<u8>>,
         use_rdo: bool,
+    ) -> io::Result<Self> {
+        Self::new_with_rdo_and_pad_policy(
+            px,
+            w,
+            h,
+            use_intrabc,
+            src_masks,
+            use_rdo,
+            FlatPadPolicy::Baseline,
+        )
+    }
+
+    fn new_with_rdo_and_pad_policy(
+        px: &'a [u8],
+        w: usize,
+        h: usize,
+        use_intrabc: bool,
+        src_masks: Option<Vec<u8>>,
+        use_rdo: bool,
+        flat_pad_policy: FlatPadPolicy,
     ) -> io::Result<Self> {
         if w > u32::MAX as usize || h > u32::MAX as usize {
             return Err(invalid_input(format!(
@@ -914,6 +1051,18 @@ impl<'a> TileEncoder<'a> {
             }
         }
         let mask_w16 = w / 16;
+        let mut colors_present = [false; 256];
+        for &v in px {
+            colors_present[v as usize] = true;
+        }
+        let mut global_colors = [0u8; 256];
+        let mut global_color_len = 0usize;
+        for (v, &present) in colors_present.iter().enumerate() {
+            if present {
+                global_colors[global_color_len] = v as u8;
+                global_color_len += 1;
+            }
+        }
         Ok(Self {
             px,
             w,
@@ -930,10 +1079,16 @@ impl<'a> TileEncoder<'a> {
             left_part: vec![0; mi_rows],
             src_masks,
             mask_w16,
+            global_colors,
+            global_color_len,
             cost: 0.0,
             candidates: 0,
             use_rdo,
             cost_only: false,
+            flat_pad_policy,
+            pad_scoring: false,
+            pad_preview_depth: 0,
+            flat_pad_stats: FlatPadStats::default(),
         })
     }
 
@@ -1019,11 +1174,15 @@ impl<'a> TileEncoder<'a> {
     // Each computes `adapt_bits` (or literal bits) from the pre-update row,
     // accumulates into `self.cost`, then encodes identically. Baseline and
     // RDO share them so committed bytes are identical for identical decisions.
-    // When `use_rdo` is false (baseline fallback) costs are never used for
-    // decisions, so the fractional estimates (including `log2`) are skipped
-    // entirely for speed; bytes and adaptive updates are unchanged.
+    // When neither RDO nor pad look-ahead scoring is active, costs are never
+    // used for decisions, so fractional estimates (including `log2`) are
+    // skipped entirely for speed; bytes and adaptive updates are unchanged.
+    fn count_cost(&self) -> bool {
+        self.use_rdo || self.pad_scoring
+    }
+
     fn enc_part(&mut self, bsl: usize, ctx: usize, s: usize) {
-        if self.use_rdo {
+        if self.count_cost() {
             let bits = adapt_bits(self.cdfs.part_row(bsl, ctx), s);
             self.cost += bits;
         }
@@ -1037,7 +1196,7 @@ impl<'a> TileEncoder<'a> {
     }
 
     fn enc_skip(&mut self, ctx: usize, s: usize) {
-        if self.use_rdo {
+        if self.count_cost() {
             let bits = adapt_bits(&self.cdfs.skip[ctx].cdf, s);
             self.cost += bits;
         }
@@ -1049,7 +1208,7 @@ impl<'a> TileEncoder<'a> {
     }
 
     fn enc_y_dc(&mut self, s: usize) {
-        if self.use_rdo {
+        if self.count_cost() {
             let bits = adapt_bits(&self.cdfs.y_dc.cdf, s);
             self.cost += bits;
         }
@@ -1061,7 +1220,7 @@ impl<'a> TileEncoder<'a> {
     }
 
     fn enc_pal_mode(&mut self, bsl: usize, pctx: usize, s: usize) {
-        if self.use_rdo {
+        if self.count_cost() {
             let bits = adapt_bits(&self.cdfs.pal_mode[bsl - 2][pctx].cdf, s);
             self.cost += bits;
         }
@@ -1073,7 +1232,7 @@ impl<'a> TileEncoder<'a> {
     }
 
     fn enc_pal_size(&mut self, bsl: usize, s: usize) {
-        if self.use_rdo {
+        if self.count_cost() {
             let bits = adapt_bits(&self.cdfs.pal_size[bsl - 2].cdf, s);
             self.cost += bits;
         }
@@ -1085,7 +1244,7 @@ impl<'a> TileEncoder<'a> {
     }
 
     fn enc_pal_idx(&mut self, n: usize, ctx: usize, s: usize) {
-        if self.use_rdo {
+        if self.count_cost() {
             let row: &[u16] = match n {
                 2 => &self.cdfs.pal_idx2[ctx].cdf,
                 3 => &self.cdfs.pal_idx3[ctx].cdf,
@@ -1102,7 +1261,7 @@ impl<'a> TileEncoder<'a> {
     }
 
     fn enc_static(&mut self, s: usize, cdf: &[u16]) {
-        if self.use_rdo {
+        if self.count_cost() {
             let bits = adapt_bits(cdf, s);
             self.cost += bits;
         }
@@ -1113,7 +1272,7 @@ impl<'a> TileEncoder<'a> {
 
     fn enc_lit(&mut self, val: u32, n: u32) {
         // Equiprobable `L()` bits (`read_literal` via fixed 1/2 CDF).
-        if self.use_rdo {
+        if self.count_cost() {
             self.cost += f64::from(n);
         }
         if !self.cost_only {
@@ -1407,6 +1566,34 @@ impl<'a> TileEncoder<'a> {
         carried: Option<((i32, i32), (i32, i32))>,
         force_palette: bool,
     ) -> io::Result<()> {
+        self.block_with_force_pad(
+            BlockContext {
+                r,
+                c,
+                bsl,
+                top_has_right,
+                carried,
+                force_palette,
+            },
+            None,
+        )
+    }
+
+    /// `forced_pad` is used only by the look-ahead's cost-only candidate
+    /// trials. Committed encoding still selects through `flat_pad_policy`.
+    fn block_with_force_pad(
+        &mut self,
+        context: BlockContext,
+        forced_pad: Option<u8>,
+    ) -> io::Result<()> {
+        let BlockContext {
+            r,
+            c,
+            bsl,
+            top_has_right,
+            carried,
+            force_palette,
+        } = context;
         let bw: usize = 4 << bsl;
         let (sx, sy) = (c * 4, r * 4);
         let bw4 = 1usize << bsl;
@@ -1462,9 +1649,9 @@ impl<'a> TileEncoder<'a> {
         // skip = 1 (no residual; reconstruction is exactly the palette
         // — or the copied pixels on the IntraBC path).
         let sctx = self.skip_ctx(r, c);
-        self.enc_skip(sctx, 1);
 
         if let Some(((my, mx), (py, px_))) = bc_match {
+            self.enc_skip(sctx, 1);
             self.encode_copy(r, c, bsl, bw4, my, mx, py, px_)?;
             return Ok(());
         }
@@ -1521,14 +1708,31 @@ impl<'a> TileEncoder<'a> {
         let (cache_arr, cache_len) = self.palette_cache(r, c);
         if n_colors == 1 {
             let v = colors[0];
-            let mut pad: Option<u8> = None;
-            for &cc in &cache_arr[..cache_len] {
-                if cc != v {
-                    pad = Some(cc);
-                    break;
-                }
+            if !self.cost_only && forced_pad.is_none() {
+                self.flat_pad_stats.committed_flat_blocks += 1;
             }
-            let pad = pad.unwrap_or(if v < 255 { v + 1 } else { v - 1 });
+            let baseline_pad = Self::baseline_flat_pad(v, &cache_arr[..cache_len]);
+            let pad = match forced_pad {
+                Some(pad) => {
+                    debug_assert_ne!(pad, v, "flat pad must differ from the used color");
+                    pad
+                }
+                None if self.flat_pad_policy == FlatPadPolicy::Lookahead
+                    && self.pad_preview_depth == 0 =>
+                {
+                    self.lookahead_flat_pad(FlatPadLookahead {
+                        r,
+                        c,
+                        bsl,
+                        top_has_right,
+                        force_palette,
+                        used: v,
+                        baseline_pad,
+                        cache: &cache_arr[..cache_len],
+                    })?
+                }
+                None => baseline_pad,
+            };
             colors[1] = pad;
             n_colors = 2;
             // Keep the 2-entry table sorted (binary_search below).
@@ -1538,13 +1742,15 @@ impl<'a> TileEncoder<'a> {
         }
         let psize = n_colors;
 
+        self.enc_skip(sctx, 1);
+
         // Palette path from here: build colors/cache/index scratch only
         // now that the copy path is ruled out.
         // (colors/cache/index construction delayed until the palette
         // branch actually needs it — copy blocks skip all of it.)
+        let emit = !self.cost_only;
+        let use_cost = self.count_cost();
         if let Some(bc) = self.intrabc.as_mut() {
-            let emit = !self.cost_only;
-            let use_cost = self.use_rdo;
             let (sym, cost) = (&mut self.sym, &mut self.cost);
             bc.flag_with_cost(sym, false, cost, use_cost, emit);
         }
@@ -1757,6 +1963,198 @@ impl<'a> TileEncoder<'a> {
         Ok(())
     }
 
+    fn baseline_flat_pad(v: u8, cache: &[u8]) -> u8 {
+        cache
+            .iter()
+            .copied()
+            .find(|&cached| cached != v)
+            .unwrap_or(if v < 255 { v + 1 } else { v - 1 })
+    }
+
+    /// Next partition node in the current 64x64 superblock's depth-first
+    /// sibling order. Every ancestor between this node and the root is
+    /// known to have split because this block was reached. Crossing to the
+    /// next superblock is deliberately outside the one-node horizon.
+    fn next_sibling_node(
+        &self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+    ) -> Option<(usize, usize, usize, bool)> {
+        let (sb_r, sb_c) = (r / 16 * 16, c / 16 * 16);
+        let (mut node_r, mut node_c, mut node_bw4) = (r, c, bw4);
+        while node_bw4 < 16 {
+            let parent_bw4 = node_bw4 * 2;
+            let parent_r = sb_r + ((node_r - sb_r) / parent_bw4) * parent_bw4;
+            let parent_c = sb_c + ((node_c - sb_c) / parent_bw4) * parent_bw4;
+            let half = parent_bw4 / 2;
+            let quad =
+                usize::from(node_r >= parent_r + half) * 2 + usize::from(node_c >= parent_c + half);
+            if quad < 3 {
+                let next_quad = quad + 1;
+                let next_r = parent_r + usize::from(next_quad >= 2) * half;
+                let next_c = parent_c + usize::from(next_quad % 2 == 1) * half;
+                let top_has_right = self.top_has_right_for_node(next_r, next_c, node_bw4);
+                return Some((next_r, next_c, node_bw4, top_has_right));
+            }
+            (node_r, node_c, node_bw4) = (parent_r, parent_c, parent_bw4);
+        }
+        None
+    }
+
+    fn top_has_right_for_node(&self, r: usize, c: usize, bw4: usize) -> bool {
+        let (mut node_r, mut node_c) = (r / 16 * 16, c / 16 * 16);
+        let mut node_bw4 = 16usize;
+        let mut top_has_right = true;
+        while node_bw4 > bw4 {
+            let half = node_bw4 / 2;
+            let quad = usize::from(r >= node_r + half) * 2 + usize::from(c >= node_c + half);
+            top_has_right = Self::child_top_right(quad, top_has_right);
+            if quad >= 2 {
+                node_r += half;
+            }
+            if quad % 2 == 1 {
+                node_c += half;
+            }
+            node_bw4 = half;
+        }
+        top_has_right
+    }
+
+    fn encode_partition_node(
+        &mut self,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        top_has_right: bool,
+    ) -> io::Result<()> {
+        if self.use_rdo {
+            self.rdo_partition(r, c, bw4, top_has_right)
+        } else {
+            self.partition(r, c, bw4, top_has_right)
+        }
+    }
+
+    /// Score one unused flat-block palette entry by cost-only replay of the
+    /// current block and one actual upcoming sibling partition node. Each
+    /// candidate gets a fresh snapshot of both node footprints, CDFs, cost,
+    /// partition state, palette neighbors, and IntraBC availability state.
+    /// The arithmetic coder is untouched because `trial()` disables output.
+    fn lookahead_flat_pad(&mut self, context: FlatPadLookahead<'_>) -> io::Result<u8> {
+        let FlatPadLookahead {
+            r,
+            c,
+            bsl,
+            top_has_right,
+            force_palette,
+            used,
+            baseline_pad,
+            cache,
+        } = context;
+        let bw4 = 1usize << bsl;
+        let Some((next_r, next_c, next_bw4, next_top_has_right)) =
+            self.next_sibling_node(r, c, bw4)
+        else {
+            return Ok(baseline_pad);
+        };
+
+        // Candidate ordering is stable and preserves the historical pad as
+        // the deterministic tie-break. Cache colors follow AV1's sorted cache
+        // order; effective-image colors follow ascending sample order.
+        let mut candidates = [0u8; 265];
+        let mut candidate_len = 0usize;
+        candidates[candidate_len] = baseline_pad;
+        candidate_len += 1;
+        for &candidate in cache
+            .iter()
+            .chain(self.global_colors[..self.global_color_len].iter())
+        {
+            // The flat source color's palette index is determined by which
+            // side of it the unused color sorts on. Keep every trial on the
+            // baseline side so the pixel-to-palette index map is unchanged.
+            if candidate == used
+                || (candidate < used) != (baseline_pad < used)
+                || candidates[..candidate_len].contains(&candidate)
+            {
+                continue;
+            }
+            candidates[candidate_len] = candidate;
+            candidate_len += 1;
+        }
+        if candidate_len == 1 {
+            return Ok(baseline_pad);
+        }
+        self.flat_pad_stats.searches += 1;
+
+        let rect_r = r.min(next_r);
+        let rect_c = c.min(next_c);
+        let rect_h = (r + bw4).max(next_r + next_bw4) - rect_r;
+        let rect_w = (c + bw4).max(next_c + next_bw4) - rect_c;
+        debug_assert!(rect_w <= 16 && rect_h <= 16);
+
+        let mut best_pad = baseline_pad;
+        let mut best_cost = f64::INFINITY;
+        let mut baseline_cost = f64::INFINITY;
+        const EPS: f64 = 1e-9;
+        for &candidate in &candidates[..candidate_len] {
+            let previous_scoring = self.pad_scoring;
+            self.pad_scoring = true;
+            let trial = self.trial(rect_r, rect_c, rect_w, rect_h, |enc| {
+                enc.block_with_force_pad(
+                    BlockContext {
+                        r,
+                        c,
+                        bsl,
+                        top_has_right,
+                        carried: None,
+                        force_palette,
+                    },
+                    Some(candidate),
+                )?;
+                let previous_preview = enc.pad_preview_depth;
+                enc.pad_preview_depth = previous_preview.saturating_add(1);
+                let preview =
+                    enc.encode_partition_node(next_r, next_c, next_bw4, next_top_has_right);
+                enc.pad_preview_depth = previous_preview;
+                preview
+            });
+            self.pad_scoring = previous_scoring;
+
+            let cost = match trial {
+                Ok(cost) => {
+                    self.flat_pad_stats.candidate_trials += 1;
+                    self.flat_pad_stats.preview_nodes += 1;
+                    cost
+                }
+                Err(_) => {
+                    self.flat_pad_stats.errors += 1;
+                    return Ok(baseline_pad);
+                }
+            };
+            if candidate == baseline_pad {
+                baseline_cost = cost;
+            }
+            if cost < best_cost - EPS {
+                best_cost = cost;
+                best_pad = candidate;
+            }
+        }
+
+        if (baseline_cost - best_cost).abs() <= EPS {
+            self.flat_pad_stats.ties += 1;
+        } else if best_pad == baseline_pad {
+            self.flat_pad_stats.baseline_wins += 1;
+        } else {
+            self.flat_pad_stats.lookahead_wins += 1;
+        }
+        debug_assert_eq!(
+            best_pad < used,
+            baseline_pad < used,
+            "flat pad selection must preserve the used color's palette index"
+        );
+        Ok(best_pad)
+    }
+
     /// Encode an IntraBC copy for the `bw4`-MI block at `(r, c)` given the
     /// chosen MV and its predictor: flag + MVD, neighbour bookkeeping
     /// (skip/psize, no `ymode` — all-DC is implicit), and `record`.
@@ -1778,6 +2176,8 @@ impl<'a> TileEncoder<'a> {
         // contexts for neighbours, mirrored in bookkeeping below.
         // Disjoint field borrows (`intrabc` vs `sym`/`cost`) keep the
         // cost-aware flag/MVD exact.
+        let emit = !self.cost_only;
+        let use_cost = self.count_cost();
         let Some(bc) = self.intrabc.as_mut() else {
             return Err(io::Error::other(
                 "internal: IntraBC match without IntraBC state",
@@ -1797,8 +2197,6 @@ impl<'a> TileEncoder<'a> {
                 "internal: IntraBC match without IntraBC state",
             ));
         };
-        let emit = !self.cost_only;
-        let use_cost = self.use_rdo;
         bc2.flag_with_cost(sym, true, cost, use_cost, emit);
         bc2.encode_mvd_with_cost(sym, ((my, mx), (py, px_)), cost, use_cost, emit);
         let n4 = 1usize << bsl;
@@ -2673,6 +3071,7 @@ impl<'a> TileEncoder<'a> {
             }
         }
         let n = self.candidates;
+        merge_flat_pad_stats(self.flat_pad_stats);
         Ok((self.sym.finish(), n))
     }
 }
@@ -2973,11 +3372,22 @@ fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>>
 /// Validates dimensions, checked area, buffer length, and supported
 /// colors at the boundary, returning `InvalidInput` instead of panicking.
 fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_with_policy(gray, w, h, FlatPadPolicy::Baseline)
+}
+
+fn encode_obu_payload_with_policy(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    flat_pad_policy: FlatPadPolicy,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
-        return encode_obu_payload_with(gray, w, h, false);
+        return encode_obu_payload_with_policy_and_intrabc(gray, w, h, false, flat_pad_policy);
     }
-    let (on_payload, on_av1c) = encode_obu_payload_with(gray, w, h, true)?;
-    let (off_payload, off_av1c) = encode_obu_payload_with(gray, w, h, false)?;
+    let (on_payload, on_av1c) =
+        encode_obu_payload_with_policy_and_intrabc(gray, w, h, true, flat_pad_policy)?;
+    let (off_payload, off_av1c) =
+        encode_obu_payload_with_policy_and_intrabc(gray, w, h, false, flat_pad_policy)?;
     if on_payload.len() <= off_payload.len() {
         Ok((on_payload, on_av1c))
     } else {
@@ -2985,15 +3395,34 @@ fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 
     }
 }
 
+#[cfg(test)]
 fn encode_obu_payload_with(
     gray: &[u8],
     w: u32,
     h: u32,
     use_intrabc: bool,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_with_policy_and_intrabc(gray, w, h, use_intrabc, FlatPadPolicy::Baseline)
+}
+
+fn encode_obu_payload_with_policy_and_intrabc(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    use_intrabc: bool,
+    flat_pad_policy: FlatPadPolicy,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
 
-    let tile = TileEncoder::new(gray, w as usize, h as usize, use_intrabc, masks)?;
+    let tile = TileEncoder::new_with_rdo_and_pad_policy(
+        gray,
+        w as usize,
+        h as usize,
+        use_intrabc,
+        masks,
+        false,
+        flat_pad_policy,
+    )?;
     let tile_data = tile.finish()?;
 
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
@@ -3016,14 +3445,33 @@ fn encode_obu_payload_with(
 /// `use_intrabc = false` exercises palette-only RDO (palette vs split);
 /// `true` exercises IntraBC-enabled RDO (palette/copy/split). Search and MV
 /// selection are unchanged; only partition/mode selection differs.
+#[cfg(test)]
 fn encode_obu_payload_with_rdo(
     gray: &[u8],
     w: u32,
     h: u32,
     use_intrabc: bool,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_with_rdo_and_pad_policy(gray, w, h, use_intrabc, FlatPadPolicy::Baseline)
+}
+
+fn encode_obu_payload_with_rdo_and_pad_policy(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    use_intrabc: bool,
+    flat_pad_policy: FlatPadPolicy,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
-    let tile = TileEncoder::new_with_rdo(gray, w as usize, h as usize, use_intrabc, masks, true)?;
+    let tile = TileEncoder::new_with_rdo_and_pad_policy(
+        gray,
+        w as usize,
+        h as usize,
+        use_intrabc,
+        masks,
+        true,
+        flat_pad_policy,
+    )?;
     let tile_data = tile.finish()?;
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
     let mut frame_payload = frame_header_bits(w, h, use_intrabc)?;
@@ -3040,10 +3488,19 @@ fn encode_obu_payload_with_rdo(
 /// and split at every contained node, so no separate on/off picking is
 /// needed; when disabled only the palette-only RDO runs.
 fn encode_obu_payload_rdo(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_rdo_with_policy(gray, w, h, FlatPadPolicy::Baseline)
+}
+
+fn encode_obu_payload_rdo_with_policy(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    flat_pad_policy: FlatPadPolicy,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
-        return encode_obu_payload_with_rdo(gray, w, h, false);
+        return encode_obu_payload_with_rdo_and_pad_policy(gray, w, h, false, flat_pad_policy);
     }
-    encode_obu_payload_with_rdo(gray, w, h, true)
+    encode_obu_payload_with_rdo_and_pad_policy(gray, w, h, true, flat_pad_policy)
 }
 
 fn av01_item(id: u32, w: u32, h: u32, payload: Vec<u8>, av1c: [u8; 4]) -> Item {
@@ -3157,6 +3614,7 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
 ///
 /// Each raster has the same supported-input constraints as `encode_gray`;
 /// violations return `InvalidInput`.
+#[cfg(test)]
 pub fn encode_gray_pair(
     small: &[u8],
     sw: u32,
@@ -3165,12 +3623,27 @@ pub fn encode_gray_pair(
     lw: u32,
     lh: u32,
 ) -> io::Result<Vec<u8>> {
-    let base_small = encode_obu_payload(small, sw, sh)?;
-    let base_large = encode_obu_payload(large, lw, lh)?;
+    encode_gray_pair_with_pad_policy(small, sw, sh, large, lw, lh, FlatPadPolicy::Baseline)
+}
+
+/// `encode_gray_pair` with an explicit flat-block padding policy. This is
+/// exposed for the bounded look-ahead experiment; the default API remains
+/// byte-identical to the historical policy.
+pub fn encode_gray_pair_with_pad_policy(
+    small: &[u8],
+    sw: u32,
+    sh: u32,
+    large: &[u8],
+    lw: u32,
+    lh: u32,
+    flat_pad_policy: FlatPadPolicy,
+) -> io::Result<Vec<u8>> {
+    let base_small = encode_obu_payload_with_policy(small, sw, sh, flat_pad_policy)?;
+    let base_large = encode_obu_payload_with_policy(large, lw, lh, flat_pad_policy)?;
     // Preserve the whole-file baseline safeguard, but make the RDO choice
     // independently for each item using only payloads already encoded.
     let mut had_rdo_error = false;
-    let rdo_small = match encode_obu_payload_rdo(small, sw, sh) {
+    let rdo_small = match encode_obu_payload_rdo_with_policy(small, sw, sh, flat_pad_policy) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
             had_rdo_error = true;
@@ -3178,7 +3651,7 @@ pub fn encode_gray_pair(
             None
         }
     };
-    let rdo_large = match encode_obu_payload_rdo(large, lw, lh) {
+    let rdo_large = match encode_obu_payload_rdo_with_policy(large, lw, lh, flat_pad_policy) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
             had_rdo_error = true;
@@ -3775,6 +4248,197 @@ mod tests {
         }
         let err = encode_gray(&many, 16, 16).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn flat_pad_lookahead_targets_the_upcoming_sibling() {
+        let (w, h) = (32usize, 16usize);
+        let mut gray = vec![0u8; w * h];
+        for row in 0..h {
+            gray[row * w + 16..row * w + w].fill(85);
+        }
+        let masks = build_source_masks(&gray, w, h).expect("four-shade source");
+        let encode_first = |enc: &mut TileEncoder<'_>| {
+            let ctx = enc.partition_ctx(0, 0, 2);
+            enc.enc_part(2, ctx, PARTITION_NONE);
+            enc.update_partition_ctx(0, 0, 2);
+            enc.block_with_force(0, 0, 2, true, None, true).unwrap();
+        };
+
+        let mut baseline = TileEncoder::new_with_rdo_and_pad_policy(
+            &gray,
+            w,
+            h,
+            false,
+            Some(masks.clone()),
+            false,
+            FlatPadPolicy::Baseline,
+        )
+        .unwrap();
+        encode_first(&mut baseline);
+        assert_eq!(&baseline.pcolors[0][..2], &[0, 1]);
+
+        let mut lookahead = TileEncoder::new_with_rdo_and_pad_policy(
+            &gray,
+            w,
+            h,
+            false,
+            Some(masks),
+            false,
+            FlatPadPolicy::Lookahead,
+        )
+        .unwrap();
+        encode_first(&mut lookahead);
+        assert_eq!(&lookahead.pcolors[0][..2], &[0, 85]);
+        assert_eq!(lookahead.flat_pad_stats.searches, 1);
+        assert_eq!(lookahead.flat_pad_stats.lookahead_wins, 1);
+        assert!(lookahead.flat_pad_stats.candidate_trials >= 2);
+        assert_eq!(gray[0], 0);
+        assert_eq!(gray[16], 85);
+    }
+
+    #[test]
+    fn flat_pad_lookahead_preserves_the_used_palette_index() {
+        let (w, h) = (48usize, 16usize);
+        let mut gray = vec![85u8; w * h];
+        for row in 0..h {
+            gray[row * w + 16..row * w + 32].fill(170);
+            gray[row * w + 32..row * w + 48].fill(0);
+        }
+        let masks = build_source_masks(&gray, w, h).expect("four-shade source");
+        let mut enc = TileEncoder::new_with_rdo_and_pad_policy(
+            &gray,
+            w,
+            h,
+            false,
+            Some(masks),
+            false,
+            FlatPadPolicy::Lookahead,
+        )
+        .unwrap();
+
+        let baseline_pad = TileEncoder::baseline_flat_pad(85, &[]);
+        enc.block_with_force(0, 0, 2, true, None, true).unwrap();
+        let selected_pad = enc.pcolors[0][..2]
+            .iter()
+            .copied()
+            .find(|&color| color != 85)
+            .unwrap();
+
+        assert_eq!(baseline_pad, 86);
+        assert!(selected_pad > 85, "opposite-side shade 0 must be excluded");
+        assert_eq!(
+            usize::from(selected_pad < 85),
+            usize::from(baseline_pad < 85)
+        );
+        assert_eq!(enc.flat_pad_stats.lookahead_wins, 1);
+    }
+
+    #[test]
+    fn flat_pad_lookahead_covers_edges_and_both_intrabc_modes() {
+        let (w, h) = (80usize, 48usize);
+        let levels = [0u8, 85, 170, 255];
+        let mut gray = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                gray[y * w + x] = levels[((x / 16) + 2 * (y / 16)) % levels.len()];
+            }
+        }
+        for use_intrabc in [false, true] {
+            for policy in [FlatPadPolicy::Baseline, FlatPadPolicy::Lookahead] {
+                let first = encode_obu_payload_with_policy_and_intrabc(
+                    &gray,
+                    w as u32,
+                    h as u32,
+                    use_intrabc,
+                    policy,
+                )
+                .unwrap();
+                let repeated = encode_obu_payload_with_policy_and_intrabc(
+                    &gray,
+                    w as u32,
+                    h as u32,
+                    use_intrabc,
+                    policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    first, repeated,
+                    "greedy edge path use_intrabc={use_intrabc} policy={policy:?}"
+                );
+
+                let first_rdo = encode_obu_payload_with_rdo_and_pad_policy(
+                    &gray,
+                    w as u32,
+                    h as u32,
+                    use_intrabc,
+                    policy,
+                )
+                .unwrap();
+                let repeated_rdo = encode_obu_payload_with_rdo_and_pad_policy(
+                    &gray,
+                    w as u32,
+                    h as u32,
+                    use_intrabc,
+                    policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    first_rdo, repeated_rdo,
+                    "RDO edge path use_intrabc={use_intrabc} policy={policy:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flat_pad_lookahead_is_restored_after_rejected_nested_rdo_trial() {
+        let (w, h) = (64usize, 64usize);
+        let levels = [0u8, 85, 170, 255];
+        let mut gray = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                gray[y * w + x] = levels[((x / 16) + 2 * (y / 16)) % levels.len()];
+            }
+        }
+        let masks = build_source_masks(&gray, w, h).expect("four-shade source");
+        let mut enc = TileEncoder::new_with_rdo_and_pad_policy(
+            &gray,
+            w,
+            h,
+            true,
+            Some(masks),
+            true,
+            FlatPadPolicy::Lookahead,
+        )
+        .unwrap();
+        let before = (
+            enc.skip.clone(),
+            enc.psize.clone(),
+            enc.pcolors.clone(),
+            enc.above_part.clone(),
+            enc.left_part.clone(),
+            enc.cdfs.clone(),
+            format!("{:?}", enc.sym),
+            enc.cost,
+            enc.candidates,
+        );
+        let _ = enc
+            .trial(0, 0, 4, 4, |trial| {
+                trial.rdo_leaf_with_plan(0, 0, 2, true, None)
+            })
+            .unwrap();
+        assert_eq!(enc.skip, before.0);
+        assert_eq!(enc.psize, before.1);
+        assert_eq!(enc.pcolors, before.2);
+        assert_eq!(enc.above_part, before.3);
+        assert_eq!(enc.left_part, before.4);
+        assert_eq!(enc.cdfs, before.5);
+        assert_eq!(format!("{:?}", enc.sym), before.6);
+        assert_eq!(enc.cost, before.7);
+        assert!(enc.candidates > before.8, "nested trials are counted");
+        assert!(enc.flat_pad_stats.searches > 0);
+        assert!(enc.flat_pad_stats.candidate_trials > 0);
     }
 
     #[test]

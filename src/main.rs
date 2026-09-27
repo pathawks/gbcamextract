@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -76,6 +76,24 @@ struct Args {
     save: PathBuf,
     #[arg(short = 'r', value_name = "rom.gb")]
     rom: Option<PathBuf>,
+    /// Policy for the unused second color in flat palette blocks.
+    #[arg(long, value_enum, default_value = "baseline")]
+    flat_pad_policy: FlatPadPolicyArg,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FlatPadPolicyArg {
+    Baseline,
+    Lookahead,
+}
+
+impl From<FlatPadPolicyArg> for mono::FlatPadPolicy {
+    fn from(value: FlatPadPolicyArg) -> Self {
+        match value {
+            FlatPadPolicyArg::Baseline => Self::Baseline,
+            FlatPadPolicyArg::Lookahead => Self::Lookahead,
+        }
+    }
 }
 
 fn is_gb_rom(data: &[u8]) -> bool {
@@ -260,6 +278,7 @@ struct EncodeIdentity {
     gray_levels: [u8; 4],
     intrabc: bool,
     rdo: bool,
+    flat_pad_policy: mono::FlatPadPolicy,
     brands: [[u8; 4]; 3],
     primary_item_id: u32,
     large_item_id: u32,
@@ -269,7 +288,12 @@ struct EncodeIdentity {
 }
 
 impl EncodeIdentity {
+    #[cfg(test)]
     fn current() -> Self {
+        Self::for_flat_pad_policy(mono::FlatPadPolicy::Baseline)
+    }
+
+    fn for_flat_pad_policy(flat_pad_policy: mono::FlatPadPolicy) -> Self {
         Self {
             small_w: WIDTH,
             small_h: HEIGHT,
@@ -279,6 +303,7 @@ impl EncodeIdentity {
             gray_levels: GRAY_8BIT,
             intrabc: mono::USE_INTRABC,
             rdo: true,
+            flat_pad_policy,
             brands: [*b"avif", *b"mif1", *b"miaf"],
             primary_item_id: 1,
             large_item_id: 1,
@@ -332,8 +357,11 @@ where
     groups
 }
 
-fn group_rendered(rasters: Vec<(usize, Vec<u8>)>) -> Vec<RasterGroup> {
-    let identity = EncodeIdentity::current();
+fn group_rendered_with_policy(
+    rasters: Vec<(usize, Vec<u8>)>,
+    flat_pad_policy: mono::FlatPadPolicy,
+) -> Vec<RasterGroup> {
+    let identity = EncodeIdentity::for_flat_pad_policy(flat_pad_policy);
     group_rendered_by(
         rasters
             .into_iter()
@@ -345,6 +373,7 @@ fn group_rendered(rasters: Vec<(usize, Vec<u8>)>) -> Vec<RasterGroup> {
 
 fn run(args: Args) -> Result<(), String> {
     let report_rdo_stats = std::env::var_os("GBCAMEXTRACT_RDO_STATS").is_some();
+    let flat_pad_policy: mono::FlatPadPolicy = args.flat_pad_policy.into();
     let save = std::fs::read(&args.save).map_err(|e| {
         format!(
             "couldn't open save '{}' for reading: {e}",
@@ -473,7 +502,7 @@ fn run(args: Args) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     rendered.sort_unstable_by_key(|(slot_num, _)| *slot_num);
-    let groups = group_rendered(rendered);
+    let groups = group_rendered_with_policy(rendered, flat_pad_policy);
     eprintln!(
         "gbcamextract: {} unique rendered rasters for 30 slots ({} duplicate slots reused)",
         groups.len(),
@@ -497,11 +526,20 @@ fn run(args: Args) -> Result<(), String> {
                 mono::pattern_cache_stats(),
                 mono::pattern_cache_stats_speculative(),
                 mono::uniform_search_stats(),
+                mono::flat_pad_stats(),
             )
         });
         let encode_started = report_rdo_stats.then(std::time::Instant::now);
-        let avif = mono::encode_gray_pair(&group.gray, WIDTH, HEIGHT, &large, LARGE_W, LARGE_H)
-            .map_err(|e| {
+        let avif = mono::encode_gray_pair_with_pad_policy(
+            &group.gray,
+            WIDTH,
+            HEIGHT,
+            &large,
+            LARGE_W,
+            LARGE_H,
+            flat_pad_policy,
+        )
+        .map_err(|e| {
                 format!(
                     "couldn't encode slot {first_slot} ({}): {e}",
                     filenames[first_slot - 1]
@@ -512,13 +550,14 @@ fn run(args: Args) -> Result<(), String> {
             paired_encode_nanos.fetch_add(elapsed.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             elapsed.as_secs_f64() * 1000.0
         });
-        if let Some((rdo0, errors0, pattern0, pattern_spec0, uniform0)) = before {
+        if let Some((rdo0, errors0, pattern0, pattern_spec0, uniform0, flat_pad0)) = before {
             let (rdo1, errors1) = (mono::rdo_stats(), mono::rdo_errors());
             let (pattern1, pattern_spec1) = (
                 mono::pattern_cache_stats(),
                 mono::pattern_cache_stats_speculative(),
             );
             let uniform1 = mono::uniform_search_stats();
+            let flat_pad1 = mono::flat_pad_stats();
             let files = group
                 .slots
                 .iter()
@@ -526,7 +565,7 @@ fn run(args: Args) -> Result<(), String> {
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "rdo-stats: files={files} bytes={} paired_ms={:.3} rdo_wins={} baseline_wins={} rdo_candidates={} rdo_errors={} pattern_committed={}/{} pattern_speculative={}/{} uniform_searches={} uniform_committed_searches={} uniform_speculative_searches={} uniform_work={} uniform_speculative_work={} uniform_fallbacks={} uniform_legal_matches={} uniform_selected={} uniform_errors={} uniform_cache_max_bytes={}",
+                "rdo-stats: files={files} bytes={} paired_ms={:.3} rdo_wins={} baseline_wins={} rdo_candidates={} rdo_errors={} pattern_committed={}/{} pattern_speculative={}/{} uniform_searches={} uniform_committed_searches={} uniform_speculative_searches={} uniform_work={} uniform_speculative_work={} uniform_fallbacks={} uniform_legal_matches={} uniform_selected={} uniform_errors={} uniform_cache_max_bytes={} flat_pad_committed_blocks={} flat_pad_searches={} flat_pad_trials={} flat_pad_preview_nodes={} flat_pad_baseline_wins={} flat_pad_lookahead_wins={} flat_pad_ties={} flat_pad_errors={}",
                 avif.len(),
                 paired_encode_ms.unwrap_or_default(),
                 rdo1.0 - rdo0.0,
@@ -547,9 +586,17 @@ fn run(args: Args) -> Result<(), String> {
                 uniform1.selected_copies - uniform0.selected_copies,
                 uniform1.errors - uniform0.errors,
                 uniform1.cache_bytes,
+                flat_pad1.committed_flat_blocks - flat_pad0.committed_flat_blocks,
+                flat_pad1.searches - flat_pad0.searches,
+                flat_pad1.candidate_trials - flat_pad0.candidate_trials,
+                flat_pad1.preview_nodes - flat_pad0.preview_nodes,
+                flat_pad1.baseline_wins - flat_pad0.baseline_wins,
+                flat_pad1.lookahead_wins - flat_pad0.lookahead_wins,
+                flat_pad1.ties - flat_pad0.ties,
+                flat_pad1.errors - flat_pad0.errors,
             );
         }
-        debug_assert_eq!(group.identity, EncodeIdentity::current());
+        debug_assert_eq!(group.identity, EncodeIdentity::for_flat_pad_policy(flat_pad_policy));
         for slot_num in group.slots {
             let filename = &filenames[slot_num - 1];
             std::fs::write(filename, &avif)
@@ -563,8 +610,9 @@ fn run(args: Args) -> Result<(), String> {
         let (pattern_speculative, pattern_speculative_fallbacks) =
             mono::pattern_cache_stats_speculative();
         let uniform = mono::uniform_search_stats();
+        let flat_pad = mono::flat_pad_stats();
         eprintln!(
-            "rdo-stats-total: rayon_threads={} paired_ms_sum={:.3} rdo_wins={} baseline_wins={} rdo_candidates={} rdo_errors={} pattern_committed={pattern_committed}/{pattern_fallbacks} pattern_speculative={pattern_speculative}/{pattern_speculative_fallbacks} uniform_searches={} uniform_committed_searches={} uniform_speculative_searches={} uniform_work={} uniform_speculative_work={} uniform_fallbacks={} uniform_legal_matches={} uniform_selected={} uniform_errors={} uniform_cache_max_bytes={}",
+            "rdo-stats-total: rayon_threads={} paired_ms_sum={:.3} rdo_wins={} baseline_wins={} rdo_candidates={} rdo_errors={} pattern_committed={pattern_committed}/{pattern_fallbacks} pattern_speculative={pattern_speculative}/{pattern_speculative_fallbacks} uniform_searches={} uniform_committed_searches={} uniform_speculative_searches={} uniform_work={} uniform_speculative_work={} uniform_fallbacks={} uniform_legal_matches={} uniform_selected={} uniform_errors={} uniform_cache_max_bytes={} flat_pad_committed_blocks={} flat_pad_searches={} flat_pad_trials={} flat_pad_preview_nodes={} flat_pad_baseline_wins={} flat_pad_lookahead_wins={} flat_pad_ties={} flat_pad_errors={}",
             rayon::current_num_threads(),
             paired_encode_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0,
             rdo.0,
@@ -581,6 +629,14 @@ fn run(args: Args) -> Result<(), String> {
             uniform.selected_copies,
             uniform.errors,
             uniform.cache_bytes,
+            flat_pad.committed_flat_blocks,
+            flat_pad.searches,
+            flat_pad.candidate_trials,
+            flat_pad.preview_nodes,
+            flat_pad.baseline_wins,
+            flat_pad.lookahead_wins,
+            flat_pad.ties,
+            flat_pad.errors,
         );
     }
     Ok(())
