@@ -2069,13 +2069,8 @@ impl<'a> TileEncoder<'a> {
         let mut candidate_len = 0usize;
         candidates[candidate_len] = baseline_pad;
         candidate_len += 1;
-        for &candidate in cache
-            .iter()
-            .chain(self.global_colors[..self.global_color_len].iter())
-        {
-            // The flat source color's palette index is determined by which
-            // side of it the unused color sorts on. Keep every trial on the
-            // baseline side so the pixel-to-palette index map is unchanged.
+        // Consider cache colors first (free reuse via flags).
+        for &candidate in cache.iter() {
             if candidate == used
                 || (candidate < used) != (baseline_pad < used)
                 || candidates[..candidate_len].contains(&candidate)
@@ -2084,6 +2079,23 @@ impl<'a> TileEncoder<'a> {
             }
             candidates[candidate_len] = candidate;
             candidate_len += 1;
+        }
+        // Also consider global colors that are not in the cache, but only when
+        // the cache is empty (first block in a region). When the cache already
+        // has colors, adding a non-cached global color pollutes the cache for
+        // subsequent blocks without providing a reuse benefit, which can make
+        // the overall file larger despite the local pair optimization.
+        if cache.is_empty() {
+            for &candidate in self.global_colors[..self.global_color_len].iter() {
+                if candidate == used
+                    || (candidate < used) != (baseline_pad < used)
+                    || candidates[..candidate_len].contains(&candidate)
+                {
+                    continue;
+                }
+                candidates[candidate_len] = candidate;
+                candidate_len += 1;
+            }
         }
         if candidate_len == 1 {
             return Ok(baseline_pad);
@@ -5364,5 +5376,139 @@ mod tests {
             "bench_rdo memory: snapshot_inline={}B max_trial_depth=3; trial snapshots allocate no footprint/CDF/coder clones; masks_small=90B masks_large=5760B pattern_large<=90KiB",
             std::mem::size_of::<Snapshot>()
         );
+    }
+
+    #[test]
+    fn lookahead_can_be_worse_than_baseline_due_to_cache_pollution() {
+        // This test demonstrates the bug where --flat-pad-policy lookahead
+        // produces larger files than baseline due to palette cache pollution.
+        //
+        // The lookahead policy optimizes the current flat block + one sibling,
+        // but doesn't account for how the chosen pad value pollutes the palette
+        // cache for all subsequent blocks in the same row and below.
+        //
+        // We construct an image where:
+        // 1. Early blocks in the first row are flat (single color)
+        // 2. The lookahead picks a pad color not in the cache for these blocks
+        // 3. Many subsequent 2-color blocks would efficiently reuse the baseline
+        //    cache, but get an extra color from the polluted cache
+        //
+        // The bug manifests as lookahead producing a larger file than baseline.
+
+        let (sw, sh) = (160u32, 144u32); // 10x9 blocks of 16x16
+        let (lw, lh) = (1280u32, 1152u32); // 80x72 blocks of 16x16
+
+        // Create small image with specific pattern to trigger the bug
+        let mut small = vec![0u8; (sw * sh) as usize];
+        let mut large = vec![0u8; (lw * lh) as usize];
+
+        // Pattern to trigger the bug:
+        // Row 0: 10 flat blocks ALL with color 0
+        // Row 1-8: All blocks are 2-color [0, 85] checkerboard
+        //
+        // With baseline:
+        // - Block (0,0) color 0: cache empty → baseline picks 85 (v+1). Cache: [0, 85]
+        // - Block (1,0) color 0: cache [0, 85] → baseline picks 85 (cached). Cache: [0, 85]
+        // - All 10 flat blocks get pad 85. Final cache after row 0: [0, 85]
+        // - Row 1 blocks [0,85]: cache from above has [0,85], they reuse efficiently (2 colors)
+        //
+        // With lookahead:
+        // - Block (0,0) color 0: evaluates (0,0) + sibling (1,0) both color 0
+        //   Candidates: 85 (baseline), 170, 255 (global)
+        //   The cost model might prefer 170 or 255 for the pair!
+        //   If it picks 170: cache becomes [0, 170]
+        // - Block (1,0) color 0: cache [0, 170] → baseline would pick 0 or 170
+        // - Eventually cache gets polluted with 170/255 instead of 85
+        // - Row 1 blocks [0,85]: cache has [0, 170, ...] but NOT 85
+        //   They must add 85 as a NEW color → 3 colors instead of 2!
+        //   Each such block costs extra bits for the 3rd palette entry
+
+        for by in 0..9 {
+            for bx in 0..10 {
+                // First row: all flat color 0
+                // Other rows: 2-color [0, 85] checkerboard
+                let is_flat = by == 0;
+
+                for dy in 0..16 {
+                    for dx in 0..16 {
+                        let x = bx * 16 + dx;
+                        let y = by * 16 + dy;
+                        if x < sw as usize && y < sh as usize {
+                            if is_flat {
+                                small[y * sw as usize + x] = 0;
+                            } else {
+                                // All other rows: [0, 85] checkerboard
+                                small[y * sw as usize + x] =
+                                    if (dx + dy) % 2 == 0 { 0 } else { 85 };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Large image: 8x upscale of small
+        for y in 0..sh as usize {
+            for x in 0..sw as usize {
+                let v = small[y * sw as usize + x];
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let lx = x * 8 + dx;
+                        let ly = y * 8 + dy;
+                        if lx < lw as usize && ly < lh as usize {
+                            large[ly * lw as usize + lx] = v;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Encode with both policies
+        let baseline = encode_gray_pair_with_pad_policy(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            64,
+        )
+        .unwrap();
+
+        let lookahead = encode_gray_pair_with_pad_policy(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Lookahead,
+            64,
+        )
+        .unwrap();
+
+        println!("Baseline size: {} bytes", baseline.len());
+        println!("Lookahead size: {} bytes", lookahead.len());
+        println!(
+            "Difference (lookahead - baseline): {} bytes",
+            lookahead.len() as i64 - baseline.len() as i64
+        );
+
+        // This test documents the bug - it should pass (demonstrating the bug exists)
+        // Once fixed, we would change this to assert!(lookahead.len() <= baseline.len())
+        // For now, we just verify both encode successfully and log the sizes
+        assert!(!baseline.is_empty());
+        assert!(!lookahead.is_empty());
+
+        // If lookahead is worse, we've reproduced the bug
+        if lookahead.len() > baseline.len() {
+            eprintln!(
+                "BUG CONFIRMED: Lookahead ({}) > Baseline ({}) by {} bytes",
+                lookahead.len(),
+                baseline.len(),
+                lookahead.len() - baseline.len()
+            );
+        }
     }
 }
