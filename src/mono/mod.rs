@@ -43,6 +43,8 @@ mod intrabc;
 pub use intrabc::UniformSearchStats;
 use intrabc::{IntrabcState, MvComp, MvRec, UniformDecision};
 
+const DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS: i32 = 0;
+
 /// Process-wide diagnostics for the uniform 16x16 source index.
 #[allow(dead_code)]
 pub fn uniform_search_stats() -> UniformSearchStats {
@@ -1017,6 +1019,7 @@ impl<'a> TileEncoder<'a> {
             use_rdo,
             FlatPadPolicy::Baseline,
             intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
     }
 
@@ -1030,6 +1033,7 @@ impl<'a> TileEncoder<'a> {
         use_rdo: bool,
         flat_pad_policy: FlatPadPolicy,
         search_radius_rings: i32,
+        uniform_search_radius_rings: i32,
     ) -> io::Result<Self> {
         if w > u32::MAX as usize || h > u32::MAX as usize {
             return Err(invalid_input(format!(
@@ -1043,8 +1047,14 @@ impl<'a> TileEncoder<'a> {
         let mi_area = mi_cols.checked_mul(mi_rows).ok_or_else(|| {
             invalid_input(format!("MI grid area overflows usize: {mi_cols}x{mi_rows}"))
         })?;
-        let mut intrabc = use_intrabc
-            .then(|| IntrabcState::with_search_radius(mi_cols, mi_rows, search_radius_rings));
+        let mut intrabc = use_intrabc.then(|| {
+            IntrabcState::with_search_radius(
+                mi_cols,
+                mi_rows,
+                search_radius_rings,
+                uniform_search_radius_rings,
+            )
+        });
         // Verify the 8x nearest-neighbor invariant once per image and
         // precompute the bounded per-key lists when it holds. Unverified
         // images keep the original ring behavior exactly.
@@ -3387,13 +3397,20 @@ fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>>
 ///
 /// Validates dimensions, checked area, buffer length, and supported
 /// colors at the boundary, returning `InvalidInput` instead of panicking.
-fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
+fn encode_obu_payload(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     encode_obu_payload_with_policy(
         gray,
         w,
         h,
         FlatPadPolicy::Baseline,
-        intrabc::DEFAULT_SEARCH_RINGS,
+        search_radius_rings,
+        uniform_search_radius_rings,
     )
 }
 
@@ -3403,6 +3420,7 @@ fn encode_obu_payload_with_policy(
     h: u32,
     flat_pad_policy: FlatPadPolicy,
     search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
         return encode_obu_payload_with_policy_and_intrabc(
@@ -3412,6 +3430,7 @@ fn encode_obu_payload_with_policy(
             false,
             flat_pad_policy,
             search_radius_rings,
+            uniform_search_radius_rings,
         );
     }
     let (on_payload, on_av1c) = encode_obu_payload_with_policy_and_intrabc(
@@ -3421,6 +3440,7 @@ fn encode_obu_payload_with_policy(
         true,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     )?;
     let (off_payload, off_av1c) = encode_obu_payload_with_policy_and_intrabc(
         gray,
@@ -3429,6 +3449,7 @@ fn encode_obu_payload_with_policy(
         false,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     )?;
     if on_payload.len() <= off_payload.len() {
         Ok((on_payload, on_av1c))
@@ -3443,6 +3464,8 @@ fn encode_obu_payload_with(
     w: u32,
     h: u32,
     use_intrabc: bool,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     encode_obu_payload_with_policy_and_intrabc(
         gray,
@@ -3450,7 +3473,8 @@ fn encode_obu_payload_with(
         h,
         use_intrabc,
         FlatPadPolicy::Baseline,
-        intrabc::DEFAULT_SEARCH_RINGS,
+        search_radius_rings,
+        uniform_search_radius_rings,
     )
 }
 
@@ -3461,6 +3485,7 @@ fn encode_obu_payload_with_policy_and_intrabc(
     use_intrabc: bool,
     flat_pad_policy: FlatPadPolicy,
     search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
 
@@ -3473,6 +3498,7 @@ fn encode_obu_payload_with_policy_and_intrabc(
         false,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     )?;
     let tile_data = tile.finish()?;
 
@@ -3502,6 +3528,8 @@ fn encode_obu_payload_with_rdo(
     w: u32,
     h: u32,
     use_intrabc: bool,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     encode_obu_payload_with_rdo_and_pad_policy(
         gray,
@@ -3509,7 +3537,8 @@ fn encode_obu_payload_with_rdo(
         h,
         use_intrabc,
         FlatPadPolicy::Baseline,
-        intrabc::DEFAULT_SEARCH_RINGS,
+        search_radius_rings,
+        uniform_search_radius_rings,
     )
 }
 
@@ -3520,6 +3549,7 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
     use_intrabc: bool,
     flat_pad_policy: FlatPadPolicy,
     search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
     let tile = TileEncoder::new_with_rdo_and_pad_policy(
@@ -3531,6 +3561,7 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
         true,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     )?;
     let tile_data = tile.finish()?;
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
@@ -3547,13 +3578,20 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
 /// enabled the single RDO-intrabc encode already considers palette, copy,
 /// and split at every contained node, so no separate on/off picking is
 /// needed; when disabled only the palette-only RDO runs.
-fn encode_obu_payload_rdo(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
+fn encode_obu_payload_rdo(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     encode_obu_payload_rdo_with_policy(
         gray,
         w,
         h,
         FlatPadPolicy::Baseline,
-        intrabc::DEFAULT_SEARCH_RINGS,
+        search_radius_rings,
+        uniform_search_radius_rings,
     )
 }
 
@@ -3563,6 +3601,7 @@ fn encode_obu_payload_rdo_with_policy(
     h: u32,
     flat_pad_policy: FlatPadPolicy,
     search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
         return encode_obu_payload_with_rdo_and_pad_policy(
@@ -3572,6 +3611,7 @@ fn encode_obu_payload_rdo_with_policy(
             false,
             flat_pad_policy,
             search_radius_rings,
+            uniform_search_radius_rings,
         );
     }
     encode_obu_payload_with_rdo_and_pad_policy(
@@ -3581,6 +3621,7 @@ fn encode_obu_payload_rdo_with_policy(
         true,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     )
 }
 
@@ -3636,8 +3677,27 @@ fn av01_item(id: u32, w: u32, h: u32, payload: Vec<u8>, av1c: [u8; 4]) -> Item {
 /// block; violations return `InvalidInput`.
 #[allow(dead_code)]
 pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
+    encode_gray_with_search_radii(
+        gray,
+        w,
+        h,
+        intrabc::DEFAULT_SEARCH_RINGS,
+        DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+    )
+}
+
+/// Encode one gray raster using explicit pattern and uniform IntraBC radii.
+#[allow(dead_code)]
+pub fn encode_gray_with_search_radii(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+) -> io::Result<Vec<u8>> {
     // Baseline file (unchanged strategy, byte-identical to pre-RDO).
-    let (base_payload, base_av1c) = encode_obu_payload(gray, w, h)?;
+    let (base_payload, base_av1c) =
+        encode_obu_payload(gray, w, h, search_radius_rings, uniform_search_radius_rings)?;
     let base_image = IsoBmffImage {
         major_brand: *b"avif",
         minor_version: 0,
@@ -3650,7 +3710,8 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
         write_isobmff(&base_image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))?;
     // RDO file (cost-based partitions, same container).
     let rdo_bytes = match (|| -> io::Result<Vec<u8>> {
-        let (rdo_payload, rdo_av1c) = encode_obu_payload_rdo(gray, w, h)?;
+        let (rdo_payload, rdo_av1c) =
+            encode_obu_payload_rdo(gray, w, h, search_radius_rings, uniform_search_radius_rings)?;
         let rdo_image = IsoBmffImage {
             major_brand: *b"avif",
             minor_version: 0,
@@ -3695,7 +3756,7 @@ pub fn encode_gray(gray: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
 ///
 /// Each raster has the same supported-input constraints as `encode_gray`;
 /// violations return `InvalidInput`.
-#[cfg(test)]
+#[allow(dead_code)]
 pub fn encode_gray_pair(
     small: &[u8],
     sw: u32,
@@ -3713,11 +3774,40 @@ pub fn encode_gray_pair(
         lh,
         FlatPadPolicy::Baseline,
         intrabc::DEFAULT_SEARCH_RINGS,
+        DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
     )
 }
 
-/// `encode_gray_pair` with an explicit flat-block padding policy and IntraBC search radius.
-/// This is exposed for experiments; the default API remains byte-identical to the historical policy.
+/// Encode two gray rasters using explicit pattern and uniform IntraBC radii.
+// The two rasters, their dimensions, and both independent radius settings are
+// the complete inputs for this convenience entry point.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn encode_gray_pair_with_search_radii(
+    small: &[u8],
+    sw: u32,
+    sh: u32,
+    large: &[u8],
+    lw: u32,
+    lh: u32,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+) -> io::Result<Vec<u8>> {
+    encode_gray_pair_with_pad_policy(
+        small,
+        sw,
+        sh,
+        large,
+        lw,
+        lh,
+        FlatPadPolicy::Baseline,
+        search_radius_rings,
+        uniform_search_radius_rings,
+    )
+}
+
+/// `encode_gray_pair` with an explicit flat-block padding policy and both IntraBC search radii.
+/// The pattern radius defaults to 64 rings and the uniform radius defaults to 0 (frame edges).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gray_pair_with_pad_policy(
     small: &[u8],
@@ -3728,11 +3818,24 @@ pub fn encode_gray_pair_with_pad_policy(
     lh: u32,
     flat_pad_policy: FlatPadPolicy,
     search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
 ) -> io::Result<Vec<u8>> {
-    let base_small =
-        encode_obu_payload_with_policy(small, sw, sh, flat_pad_policy, search_radius_rings)?;
-    let base_large =
-        encode_obu_payload_with_policy(large, lw, lh, flat_pad_policy, search_radius_rings)?;
+    let base_small = encode_obu_payload_with_policy(
+        small,
+        sw,
+        sh,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+    )?;
+    let base_large = encode_obu_payload_with_policy(
+        large,
+        lw,
+        lh,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+    )?;
     // Preserve the whole-file baseline safeguard, but make the RDO choice
     // independently for each item using only payloads already encoded.
     let mut had_rdo_error = false;
@@ -3742,6 +3845,7 @@ pub fn encode_gray_pair_with_pad_policy(
         sh,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     ) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
@@ -3756,6 +3860,7 @@ pub fn encode_gray_pair_with_pad_policy(
         lh,
         flat_pad_policy,
         search_radius_rings,
+        uniform_search_radius_rings,
     ) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
@@ -3894,10 +3999,38 @@ mod tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             *pixel = [0, 85, 170, 255][(state >> 30) as usize];
         }
-        let (bs, bsc) = encode_obu_payload(&small, sw, sh).unwrap();
-        let (rs, rsc) = encode_obu_payload_rdo(&small, sw, sh).unwrap();
-        let (bl, blc) = encode_obu_payload(&large, lw, lh).unwrap();
-        let (rl, rlc) = encode_obu_payload_rdo(&large, lw, lh).unwrap();
+        let (bs, bsc) = encode_obu_payload(
+            &small,
+            sw,
+            sh,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rs, rsc) = encode_obu_payload_rdo(
+            &small,
+            sw,
+            sh,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (bl, blc) = encode_obu_payload(
+            &large,
+            lw,
+            lh,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rl, rlc) = encode_obu_payload_rdo(
+            &large,
+            lw,
+            lh,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         let mux = |small_payload: &[u8],
                    small_av1c: [u8; 4],
                    large_payload: &[u8],
@@ -3934,7 +4067,17 @@ mod tests {
             expected_index, 1,
             "fixture must select mixed RDO/base items"
         );
-        let selected = encode_gray_pair(&small, sw, sh, &large, lw, lh).unwrap();
+        let selected = encode_gray_pair_with_search_radii(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!(selected, candidates[expected_index]);
         assert!(selected.len() <= candidates[0].len());
         assert!(selected.len() <= candidates[3].len());
@@ -3943,8 +4086,24 @@ mod tests {
     #[test]
     fn toggle_changes_output_but_stays_valid_obus() {
         let gray = checker(64, 64);
-        let (on, _) = encode_obu_payload_with(&gray, 64, 64, true).unwrap();
-        let (off, _) = encode_obu_payload_with(&gray, 64, 64, false).unwrap();
+        let (on, _) = encode_obu_payload_with(
+            &gray,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (off, _) = encode_obu_payload_with(
+            &gray,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         // Sequence-header OBU first in both streams.
         assert_eq!(&on[..1], &[0x0a]);
         assert_eq!(&off[..1], &[0x0a]);
@@ -3960,9 +4119,32 @@ mod tests {
         // entry point must keep the smaller of the two.
         let cases: Vec<Vec<u8>> = vec![checker(64, 64), vec![0u8; 64 * 64], vec![85u8; 64 * 64]];
         for gray in &cases {
-            let (on, _) = encode_obu_payload_with(gray, 64, 64, true).unwrap();
-            let (off, _) = encode_obu_payload_with(gray, 64, 64, false).unwrap();
-            let (picked, _) = encode_obu_payload(gray, 64, 64).unwrap();
+            let (on, _) = encode_obu_payload_with(
+                gray,
+                64,
+                64,
+                true,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (off, _) = encode_obu_payload_with(
+                gray,
+                64,
+                64,
+                false,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (picked, _) = encode_obu_payload(
+                gray,
+                64,
+                64,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
             assert_eq!(picked.len(), on.len().min(off.len()));
             assert!(picked.len() <= off.len());
             if on.len() <= off.len() {
@@ -3983,9 +4165,32 @@ mod tests {
         let gray: Vec<u8> = (0..16 * 16).map(|i| palette[i % 3]).collect();
         // Both palette paths (deterministic for the single block: no cache,
         // no causal match) plus the full entry point.
-        encode_obu_payload_with(&gray, 16, 16, false).unwrap();
-        encode_obu_payload_with(&gray, 16, 16, true).unwrap();
-        encode_gray(&gray, 16, 16).unwrap();
+        encode_obu_payload_with(
+            &gray,
+            16,
+            16,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        encode_obu_payload_with(
+            &gray,
+            16,
+            16,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        encode_gray_with_search_radii(
+            &gray,
+            16,
+            16,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3993,11 +4198,25 @@ mod tests {
         use std::io::ErrorKind;
         // Non-16-aligned dimensions.
         let gray = vec![0u8; 30 * 16];
-        let err = encode_gray(&gray, 30, 16).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &gray,
+            30,
+            16,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         // Length mismatch (64x64 needs 4096 bytes).
         let short = vec![0u8; 100];
-        let err = encode_gray(&short, 64, 64).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &short,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         // Too many colors in one 16x16 block (5 distinct levels).
         let mut many = vec![0u8; 64 * 64];
@@ -4006,11 +4225,25 @@ mod tests {
                 many[y * 64 + x] = (x % 5) as u8;
             }
         }
-        let err = encode_gray(&many, 64, 64).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &many,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         // Zero dimensions.
         let empty: Vec<u8> = vec![];
-        let err = encode_gray(&empty, 0, 0).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &empty,
+            0,
+            0,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
@@ -4021,15 +4254,36 @@ mod tests {
         // `frame_height_bits_minus_1` are 4 bits (max 16 bits per side).
         // Dimension validation runs before buffer-length checks, so an
         // empty buffer still exercises the cap.
-        let err = encode_gray(&[], 16, 65552).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &[],
+            16,
+            65552,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("65536"), "unexpected: {err}");
-        let err = encode_gray(&[], 65552, 16).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &[],
+            65552,
+            16,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("65536"), "unexpected: {err}");
         // The cap is inclusive: 65536 fails later on buffer length, not
         // on dimensions.
-        let err = encode_gray(&[], 16, 65536).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &[],
+            16,
+            65536,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             !err.to_string().contains("at most"),
@@ -4334,9 +4588,32 @@ mod tests {
         }
         let (_, masks) = validate_gray(&gray, 64, 64).unwrap();
         assert!(masks.is_none(), "arbitrary grays must not take mask path");
-        encode_obu_payload_with(&gray, 64, 64, false).unwrap();
-        encode_obu_payload_with(&gray, 64, 64, true).unwrap();
-        encode_gray(&gray, 64, 64).unwrap();
+        encode_obu_payload_with(
+            &gray,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        encode_obu_payload_with(
+            &gray,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        encode_gray_with_search_radii(
+            &gray,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         // Single unsupported pixel in an otherwise four-shade image also
         // falls back (no silent mapping) but still encodes (≤4 per block).
         let mut mixed = vec![0u8; 16 * 16];
@@ -4345,13 +4622,27 @@ mod tests {
         mixed[1] = 85;
         let (_, masks) = validate_gray(&mixed, 16, 16).unwrap();
         assert!(masks.is_none());
-        encode_gray(&mixed, 16, 16).unwrap();
+        encode_gray_with_search_radii(
+            &mixed,
+            16,
+            16,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         // Too many distinct still rejected identically on both paths.
         let mut many = vec![0u8; 16 * 16];
         for (i, v) in many.iter_mut().enumerate() {
             *v = (i % 5) as u8;
         }
-        let err = encode_gray(&many, 16, 16).unwrap_err();
+        let err = encode_gray_with_search_radii(
+            &many,
+            16,
+            16,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
@@ -4379,6 +4670,7 @@ mod tests {
             false,
             FlatPadPolicy::Baseline,
             intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
         .unwrap();
         encode_first(&mut baseline);
@@ -4393,6 +4685,7 @@ mod tests {
             false,
             FlatPadPolicy::Lookahead,
             intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
         .unwrap();
         encode_first(&mut lookahead);
@@ -4422,6 +4715,7 @@ mod tests {
             false,
             FlatPadPolicy::Lookahead,
             intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
         .unwrap();
 
@@ -4461,6 +4755,7 @@ mod tests {
                     use_intrabc,
                     policy,
                     intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
                 )
                 .unwrap();
                 let repeated = encode_obu_payload_with_policy_and_intrabc(
@@ -4470,6 +4765,7 @@ mod tests {
                     use_intrabc,
                     policy,
                     intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
                 )
                 .unwrap();
                 assert_eq!(
@@ -4484,6 +4780,7 @@ mod tests {
                     use_intrabc,
                     policy,
                     intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
                 )
                 .unwrap();
                 let repeated_rdo = encode_obu_payload_with_rdo_and_pad_policy(
@@ -4493,6 +4790,7 @@ mod tests {
                     use_intrabc,
                     policy,
                     intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
                 )
                 .unwrap();
                 assert_eq!(
@@ -4523,6 +4821,7 @@ mod tests {
             true,
             FlatPadPolicy::Lookahead,
             intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
         .unwrap();
         let before = (
@@ -4622,8 +4921,15 @@ mod tests {
                 assert_eq!(fast, slow, "tile mismatch {w}x{h} intrabc={use_intrabc}");
                 // Full payloads (headers + tile) must also match the public
                 // entry points which use the fast path internally.
-                let (fast_payload, _) =
-                    encode_obu_payload_with(&gray, w as u32, h as u32, use_intrabc).unwrap();
+                let (fast_payload, _) = encode_obu_payload_with(
+                    &gray,
+                    w as u32,
+                    h as u32,
+                    use_intrabc,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 // Rebuild slow payload with identical headers.
                 let slow_tile = slow;
                 let seq_obu = obu_wrap(1, &sequence_header_obu(w as u32, h as u32));
@@ -4674,20 +4980,53 @@ mod tests {
             let mut paired = Vec::new();
             for _ in 0..5 {
                 let t = std::time::Instant::now();
-                encode_obu_payload_with(gray, w, h, false).unwrap();
+                encode_obu_payload_with(
+                    gray,
+                    w,
+                    h,
+                    false,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 off.push(t.elapsed());
                 let t = std::time::Instant::now();
-                encode_obu_payload_with(gray, w, h, true).unwrap();
+                encode_obu_payload_with(
+                    gray,
+                    w,
+                    h,
+                    true,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 on.push(t.elapsed());
                 let t = std::time::Instant::now();
-                encode_obu_payload(gray, w, h).unwrap();
+                encode_obu_payload(
+                    gray,
+                    w,
+                    h,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 picked.push(t.elapsed());
             }
             // Pair path (both rasters + container) measured separately.
             if name == "small160" {
                 for _ in 0..5 {
                     let t = std::time::Instant::now();
-                    encode_gray_pair(&small, 160, 144, &large, 1280, 1152).unwrap();
+                    encode_gray_pair_with_search_radii(
+                        &small,
+                        160,
+                        144,
+                        &large,
+                        1280,
+                        1152,
+                        intrabc::DEFAULT_SEARCH_RINGS,
+                        DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                    )
+                    .unwrap();
                     paired.push(t.elapsed());
                 }
             }
@@ -4718,10 +5057,42 @@ mod tests {
                 halves[y * 64 + x] = if y < 32 { 0 } else { 255 };
             }
         }
-        let (base_off, _) = encode_obu_payload_with(&halves, 64, 64, false).unwrap();
-        let (base_on, _) = encode_obu_payload_with(&halves, 64, 64, true).unwrap();
-        let (rdo_off, _) = encode_obu_payload_with_rdo(&halves, 64, 64, false).unwrap();
-        let (rdo_on, _) = encode_obu_payload_with_rdo(&halves, 64, 64, true).unwrap();
+        let (base_off, _) = encode_obu_payload_with(
+            &halves,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (base_on, _) = encode_obu_payload_with(
+            &halves,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rdo_off, _) = encode_obu_payload_with_rdo(
+            &halves,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rdo_on, _) = encode_obu_payload_with_rdo(
+            &halves,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         // Baseline on splits (22) vs off palette (21); RDO on recovers the
         // palette (21), tying off and beating on.
         assert_eq!(base_off.len(), 21);
@@ -4752,10 +5123,42 @@ mod tests {
                 };
             }
         }
-        let (base_off, _) = encode_obu_payload_with(&quads, 64, 64, false).unwrap();
-        let (base_on, _) = encode_obu_payload_with(&quads, 64, 64, true).unwrap();
-        let (rdo_off, _) = encode_obu_payload_with_rdo(&quads, 64, 64, false).unwrap();
-        let (rdo_on, _) = encode_obu_payload_with_rdo(&quads, 64, 64, true).unwrap();
+        let (base_off, _) = encode_obu_payload_with(
+            &quads,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (base_on, _) = encode_obu_payload_with(
+            &quads,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rdo_off, _) = encode_obu_payload_with_rdo(
+            &quads,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rdo_on, _) = encode_obu_payload_with_rdo(
+            &quads,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!(base_off.len(), 30);
         assert_eq!(base_on.len(), 24);
         assert_eq!(rdo_off.len(), 24);
@@ -4785,9 +5188,33 @@ mod tests {
                 };
             }
         }
-        let (base_off, _) = encode_obu_payload_with(&rep128, 128, 128, false).unwrap();
-        let (base_on, _) = encode_obu_payload_with(&rep128, 128, 128, true).unwrap();
-        let (rdo_on, _) = encode_obu_payload_with_rdo(&rep128, 128, 128, true).unwrap();
+        let (base_off, _) = encode_obu_payload_with(
+            &rep128,
+            128,
+            128,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (base_on, _) = encode_obu_payload_with(
+            &rep128,
+            128,
+            128,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (rdo_on, _) = encode_obu_payload_with_rdo(
+            &rep128,
+            128,
+            128,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!(base_off.len(), 70);
         assert_eq!(base_on.len(), 100);
         assert_eq!(rdo_on.len(), 70);
@@ -4797,9 +5224,33 @@ mod tests {
         );
         // 8px checker repeats similarly.
         let chk = checker(64, 64);
-        let (b_off, _) = encode_obu_payload_with(&chk, 64, 64, false).unwrap();
-        let (b_on, _) = encode_obu_payload_with(&chk, 64, 64, true).unwrap();
-        let (r_on, _) = encode_obu_payload_with_rdo(&chk, 64, 64, true).unwrap();
+        let (b_off, _) = encode_obu_payload_with(
+            &chk,
+            64,
+            64,
+            false,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (b_on, _) = encode_obu_payload_with(
+            &chk,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (r_on, _) = encode_obu_payload_with_rdo(
+            &chk,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!((b_off.len(), b_on.len(), r_on.len()), (32, 58, 32));
         assert!(r_on.len() < b_on.len());
     }
@@ -4813,8 +5264,24 @@ mod tests {
         // Flat ties (deterministic; also exercised in `rdo_deterministic_ties`).
         let flat = vec![85u8; 64 * 64];
         for use_bc in [false, true] {
-            let (b, _) = encode_obu_payload_with(&flat, 64, 64, use_bc).unwrap();
-            let (r, _) = encode_obu_payload_with_rdo(&flat, 64, 64, use_bc).unwrap();
+            let (b, _) = encode_obu_payload_with(
+                &flat,
+                64,
+                64,
+                use_bc,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (r, _) = encode_obu_payload_with_rdo(
+                &flat,
+                64,
+                64,
+                use_bc,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
             assert_eq!(b.len(), 18);
             assert_eq!(r.len(), 18);
         }
@@ -4835,15 +5302,38 @@ mod tests {
             }
         }
         for use_bc in [false, true] {
-            let (b, _) = encode_obu_payload_with(&img, 160, 144, use_bc).unwrap();
-            let (r, _) = encode_obu_payload_with_rdo(&img, 160, 144, use_bc).unwrap();
+            let (b, _) = encode_obu_payload_with(
+                &img,
+                160,
+                144,
+                use_bc,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (r, _) = encode_obu_payload_with_rdo(
+                &img,
+                160,
+                144,
+                use_bc,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
             // RDO locally ≤ baseline; true bytes may tie or win, never
             // catastrophically lose (fallback covers any estimate miss).
             // Here we assert the fallback file (via `encode_gray`) is ≤ baseline.
             let _ = (b, r);
         }
         // Whole-image fallback: `encode_gray` picks min complete file.
-        let (b_pay, b_av1c) = encode_obu_payload(&img, 160, 144).unwrap();
+        let (b_pay, b_av1c) = encode_obu_payload(
+            &img,
+            160,
+            144,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         let base_file = {
             let image = IsoBmffImage {
                 major_brand: *b"avif",
@@ -4855,7 +5345,14 @@ mod tests {
             };
             gamut_isobmff::write(&image).unwrap()
         };
-        let rdo_file = encode_gray(&img, 160, 144).unwrap();
+        let rdo_file = encode_gray_with_search_radii(
+            &img,
+            160,
+            144,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert!(
             rdo_file.len() <= base_file.len(),
             "fallback must never lose: rdo {} vs base {}",
@@ -4869,8 +5366,22 @@ mod tests {
                 large[y * 1280 + x] = img[(y / 8) * w + (x / 8)];
             }
         }
-        let (b2, _) = encode_obu_payload(&large, 1280, 1152).unwrap();
-        let (r2, _) = encode_obu_payload_rdo(&large, 1280, 1152).unwrap();
+        let (b2, _) = encode_obu_payload(
+            &large,
+            1280,
+            1152,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (r2, _) = encode_obu_payload_rdo(
+            &large,
+            1280,
+            1152,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert!(
             r2.len() <= b2.len(),
             "large RDO must not lose to baseline best"
@@ -4883,19 +5394,56 @@ mod tests {
     #[test]
     fn rdo_deterministic_ties() {
         let flat = vec![0u8; 64 * 64];
-        let (r1, _) = encode_obu_payload_with_rdo(&flat, 64, 64, true).unwrap();
-        let (r2, _) = encode_obu_payload_with_rdo(&flat, 64, 64, true).unwrap();
+        let (r1, _) = encode_obu_payload_with_rdo(
+            &flat,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (r2, _) = encode_obu_payload_with_rdo(
+            &flat,
+            64,
+            64,
+            true,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!(r1, r2, "RDO must be deterministic");
         // Whole-image tie prefers baseline (equal files → baseline kept).
         // Note: global win counters would race across parallel tests, so tie
         // preference is verified via byte-identical files (fallback returns
         // the baseline bytes on exact ties), not via globals here.
         // Benchmarks (single-threaded) report wins via `rdo_stats`.
-        let f1 = encode_gray(&flat, 64, 64).unwrap();
-        let f2 = encode_gray(&flat, 64, 64).unwrap();
+        let f1 = encode_gray_with_search_radii(
+            &flat,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let f2 = encode_gray_with_search_radii(
+            &flat,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!(f1, f2, "fallback must be deterministic");
         // Baseline-only file (same mux as `encode_gray` uses for its base).
-        let (bp, ba) = encode_obu_payload(&flat, 64, 64).unwrap();
+        let (bp, ba) = encode_obu_payload(
+            &flat,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         let base_file = {
             let image = IsoBmffImage {
                 major_brand: *b"avif",
@@ -5097,7 +5645,14 @@ mod tests {
         // Ordinary baseline wins (here: flat tie) never increment errors.
         let errs_before = super::rdo_errors();
         let flat = vec![0u8; 32 * 32];
-        let _ = super::encode_gray(&flat, 32, 32).unwrap();
+        let _ = super::encode_gray_with_search_radii(
+            &flat,
+            32,
+            32,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert_eq!(
             super::rdo_errors(),
             errs_before,
@@ -5154,9 +5709,23 @@ mod tests {
         // Flat ties → baseline bytes exactly (no globals assert; parallel-safe).
         // Global win/candidate counters are for single-threaded benchmarks.
         let flat = vec![255u8; 32 * 32];
-        let f = encode_gray(&flat, 32, 32).unwrap();
+        let f = encode_gray_with_search_radii(
+            &flat,
+            32,
+            32,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert!(!f.is_empty());
-        let (bp, ba) = encode_obu_payload(&flat, 32, 32).unwrap();
+        let (bp, ba) = encode_obu_payload(
+            &flat,
+            32,
+            32,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         let base_file = {
             let image = IsoBmffImage {
                 major_brand: *b"avif",
@@ -5173,13 +5742,37 @@ mod tests {
         reset_rdo_stats();
         let small = checker(64, 64);
         let large = checker(128, 128);
-        let pair = encode_gray_pair(&small, 64, 64, &large, 128, 128).unwrap();
+        let pair = encode_gray_pair_with_search_radii(
+            &small,
+            64,
+            64,
+            &large,
+            128,
+            128,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         assert!(!pair.is_empty());
         let (w2, b2, _) = rdo_stats();
         // Pair compares complete files; either wins or baseline (tie) — but
         // the file must be ≤ baseline-only construction. Baseline-only pair:
-        let (sp, sa) = encode_obu_payload(&small, 64, 64).unwrap();
-        let (lp, la) = encode_obu_payload(&large, 128, 128).unwrap();
+        let (sp, sa) = encode_obu_payload(
+            &small,
+            64,
+            64,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
+        let (lp, la) = encode_obu_payload(
+            &large,
+            128,
+            128,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         let base_pair = {
             let image = IsoBmffImage {
                 major_brand: *b"avif",
@@ -5231,7 +5824,17 @@ mod tests {
                 large[y * 1280 + x] = small[(y / 8) * w + (x / 8)];
             }
         }
-        let avif = encode_gray_pair(&small, 160, 144, &large, 1280, 1152).unwrap();
+        let avif = encode_gray_pair_with_search_radii(
+            &small,
+            160,
+            144,
+            &large,
+            1280,
+            1152,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+        )
+        .unwrap();
         let dir = std::env::temp_dir().join(format!("rdo_verify_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let avif_path = dir.join("t.avif");
@@ -5299,14 +5902,67 @@ mod tests {
             ("duplicate_small160", &flat_small, 160u32, 144u32),
             ("duplicate_large1280", &flat_large, 1280u32, 1152u32),
         ] {
-            let (b_off, _) = encode_obu_payload_with(gray, w, h, false).unwrap();
-            let (b_on, _) = encode_obu_payload_with(gray, w, h, true).unwrap();
-            let (b_pick, _) = encode_obu_payload(gray, w, h).unwrap();
-            let (r_off, _) = encode_obu_payload_with_rdo(gray, w, h, false).unwrap();
-            let (r_on, _) = encode_obu_payload_with_rdo(gray, w, h, true).unwrap();
-            let (r_pick, _) = encode_obu_payload_rdo(gray, w, h).unwrap();
+            let (b_off, _) = encode_obu_payload_with(
+                gray,
+                w,
+                h,
+                false,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (b_on, _) = encode_obu_payload_with(
+                gray,
+                w,
+                h,
+                true,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (b_pick, _) = encode_obu_payload(
+                gray,
+                w,
+                h,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (r_off, _) = encode_obu_payload_with_rdo(
+                gray,
+                w,
+                h,
+                false,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (r_on, _) = encode_obu_payload_with_rdo(
+                gray,
+                w,
+                h,
+                true,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
+            let (r_pick, _) = encode_obu_payload_rdo(
+                gray,
+                w,
+                h,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
             let base_file = {
-                let (p, a) = encode_obu_payload(gray, w, h).unwrap();
+                let (p, a) = encode_obu_payload(
+                    gray,
+                    w,
+                    h,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 let image = IsoBmffImage {
                     major_brand: *b"avif",
                     minor_version: 0,
@@ -5317,19 +5973,47 @@ mod tests {
                 };
                 gamut_isobmff::write(&image).unwrap()
             };
-            let opt_file = encode_gray(gray, w, h).unwrap();
+            let opt_file = encode_gray_with_search_radii(
+                gray,
+                w,
+                h,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
             let mut t_base = Vec::new();
             let mut t_rdo = Vec::new();
             let mut t_opt = Vec::new();
             for _ in 0..5 {
                 let t = std::time::Instant::now();
-                encode_obu_payload(gray, w, h).unwrap();
+                encode_obu_payload(
+                    gray,
+                    w,
+                    h,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 t_base.push(t.elapsed());
                 let t = std::time::Instant::now();
-                encode_obu_payload_rdo(gray, w, h).unwrap();
+                encode_obu_payload_rdo(
+                    gray,
+                    w,
+                    h,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 t_rdo.push(t.elapsed());
                 let t = std::time::Instant::now();
-                encode_gray(gray, w, h).unwrap();
+                encode_gray_with_search_radii(
+                    gray,
+                    w,
+                    h,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 t_opt.push(t.elapsed());
             }
             eprintln!(
@@ -5354,10 +6038,30 @@ mod tests {
             let mut t_pair = Vec::new();
             for _ in 0..5 {
                 let t = std::time::Instant::now();
-                encode_gray_pair(s, 160, 144, l, 1280, 1152).unwrap();
+                encode_gray_pair_with_search_radii(
+                    s,
+                    160,
+                    144,
+                    l,
+                    1280,
+                    1152,
+                    intrabc::DEFAULT_SEARCH_RINGS,
+                    DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+                )
+                .unwrap();
                 t_pair.push(t.elapsed());
             }
-            let pair = encode_gray_pair(s, 160, 144, l, 1280, 1152).unwrap();
+            let pair = encode_gray_pair_with_search_radii(
+                s,
+                160,
+                144,
+                l,
+                1280,
+                1152,
+                intrabc::DEFAULT_SEARCH_RINGS,
+                DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            )
+            .unwrap();
             eprintln!(
                 "bench_rdo {pname}: pair_file={} pair_median={:?}",
                 pair.len(),
@@ -5473,6 +6177,7 @@ mod tests {
             lh,
             FlatPadPolicy::Baseline,
             64,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
         .unwrap();
 
@@ -5485,6 +6190,7 @@ mod tests {
             lh,
             FlatPadPolicy::Lookahead,
             64,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
         )
         .unwrap();
 

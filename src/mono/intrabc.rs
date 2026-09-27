@@ -566,9 +566,12 @@ pub struct IntrabcState {
     pub(super) decoded: Vec<bool>,
     pattern: PatternCache,
     uniform: UniformCache,
-    /// Configured search radius in 4px rings. 0 means "unbounded" (frame edges).
-    /// Defaults to 64 (±256px) if not set.
+    /// Configured search radius in 4px rings for pattern cache. 0 = frame edges.
+    /// Defaults to 64 (±256px).
     search_radius_rings: i32,
+    /// Configured search radius in 4px rings for uniform cache. 0 = frame edges.
+    /// Defaults to 0 (unbounded).
+    uniform_search_radius_rings: i32,
     /// Nesting-aware speculative depth (see `is_speculative`): trials push
     /// depth so rejected candidates increment speculative (not committed)
     /// diagnostics; the winning re-encode runs at the enclosing depth so
@@ -579,14 +582,18 @@ pub struct IntrabcState {
 impl IntrabcState {
     #[allow(dead_code)]
     pub fn new(cols: usize, rows: usize) -> Self {
-        Self::with_search_radius(cols, rows, DEFAULT_SEARCH_RINGS)
+        Self::with_search_radius(cols, rows, DEFAULT_SEARCH_RINGS, 0)
     }
 
-    /// Create a new IntrabcState with a custom search radius.
-    /// `radius_rings`: number of 4px rings to search (each ring = 4px).
-    /// Default is 64 (±256px). For 1280x1152 upscaled images, larger values
-    /// like 256 (±1024px) or 512 (±2048px) may find more matches.
-    pub fn with_search_radius(cols: usize, rows: usize, radius_rings: i32) -> Self {
+    /// Create a new IntrabcState with custom search radii.
+    /// `search_radius_rings`: number of 4px rings for pattern cache (default 64 = ±256px).
+    /// `uniform_search_radius_rings`: number of 4px rings for uniform cache (default 0 = unbounded).
+    pub fn with_search_radius(
+        cols: usize,
+        rows: usize,
+        search_radius_rings: i32,
+        uniform_search_radius_rings: i32,
+    ) -> Self {
         let blank = MvRec {
             intrabc: false,
             my: 0,
@@ -604,7 +611,8 @@ impl IntrabcState {
             decoded: vec![false; cols * rows],
             pattern: PatternCache::empty(),
             uniform: UniformCache::empty(),
-            search_radius_rings: radius_rings,
+            search_radius_rings,
+            uniform_search_radius_rings,
             speculative: 0,
         }
     }
@@ -714,6 +722,32 @@ impl IntrabcState {
         bw4: usize,
         bh4: usize,
         top_has_right: bool,
+    ) -> io::Result<UniformDecision> {
+        self.find_uniform_match_inner(
+            px,
+            img_w,
+            img_h,
+            r,
+            c,
+            bw4,
+            bh4,
+            top_has_right,
+            self.uniform_search_radius_rings,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_uniform_match_inner(
+        &self,
+        px: &[u8],
+        img_w: usize,
+        img_h: usize,
+        r: usize,
+        c: usize,
+        bw4: usize,
+        bh4: usize,
+        top_has_right: bool,
+        uniform_search_radius_rings: i32,
     ) -> io::Result<UniformDecision> {
         let fail = |kind, message: String| {
             self.uniform.errors.set(self.uniform.errors.get() + 1);
@@ -831,7 +865,10 @@ impl IntrabcState {
         // region. This extends the legacy 256px radius without truncating
         // any legal uniform source and stops as soon as the first ring-order
         // match is found.
-        let max_ring = (max_distance + MATCH_STEP - 1) / MATCH_STEP;
+        let mut max_ring = (max_distance + MATCH_STEP - 1) / MATCH_STEP;
+        if uniform_search_radius_rings != 0 && max_ring > uniform_search_radius_rings {
+            max_ring = uniform_search_radius_rings;
+        }
         let probe = |x0: i32, y0: i32| -> Option<(i32, i32)> {
             if !regions[..region_count]
                 .iter()

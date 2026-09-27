@@ -84,6 +84,10 @@ struct Args {
     /// like 256 (±1024px) or 512 (±2048px) may find more matches.
     #[arg(long, default_value = "64")]
     intrabc_search_radius: i32,
+    /// IntraBC uniform-block search radius in 4px rings (each ring = 4px).
+    /// Default: 0 (unbounded = frame edges). Non-zero values cap the search.
+    #[arg(long, default_value = "0")]
+    intrabc_uniform_search_radius: i32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -379,6 +383,12 @@ fn group_rendered_with_policy(
 fn run(args: Args) -> Result<(), String> {
     let report_rdo_stats = std::env::var_os("GBCAMEXTRACT_RDO_STATS").is_some();
     let flat_pad_policy: mono::FlatPadPolicy = args.flat_pad_policy.into();
+    if args.intrabc_search_radius < 0 {
+        return Err("--intrabc-search-radius must be >= 0".into());
+    }
+    if args.intrabc_uniform_search_radius < 0 {
+        return Err("--intrabc-uniform-search-radius must be >= 0".into());
+    }
     let save = std::fs::read(&args.save).map_err(|e| {
         format!(
             "couldn't open save '{}' for reading: {e}",
@@ -544,6 +554,7 @@ fn run(args: Args) -> Result<(), String> {
             LARGE_H,
             flat_pad_policy,
             args.intrabc_search_radius,
+            args.intrabc_uniform_search_radius,
         )
         .map_err(|e| {
                 format!(
