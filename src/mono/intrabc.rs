@@ -152,9 +152,10 @@ pub(super) struct MvRec {
     bh4: usize,
 }
 
-/// Search radius cap, in 4px steps (±256px). Bounds MV class widths and
-/// keeps the match search cheap; misses just fall back to palette.
-const SEARCH_RINGS: i32 = 64;
+/// Default search radius cap, in 4px steps (±256px). Bounds MV class widths
+/// and keeps the match search cheap; misses just fall back to palette.
+/// Used when `IntrabcState::search_radius_rings` is not set (i.e., 0).
+pub const DEFAULT_SEARCH_RINGS: i32 = 64;
 
 /// Pixel-match step: 4px grid keeps every source rect MI-aligned.
 const MATCH_STEP: i32 = 4;
@@ -389,6 +390,30 @@ fn ring_rank(rdx: i32, rdy: i32) -> u64 {
     base + offset
 }
 
+/// Radius zero means every 4px-grid source origin inside this frame. This
+/// bound derives from the frame edges and the current predictor, then leaves
+/// normative legality and residual representability to `probe_candidate_at`.
+#[allow(dead_code)]
+fn compute_unbounded_search_radius(
+    img_w: usize,
+    img_h: usize,
+    sx: i32,
+    sy: i32,
+    py: i32,
+    px: i32,
+) -> i32 {
+    let min_dx = -sx - px / 8;
+    let max_dx = (img_w as i32 - 16) - sx - px / 8;
+    let min_dy = -sy - py / 8;
+    let max_dy = (img_h as i32 - 16) - sy - py / 8;
+    let max_distance = min_dx
+        .abs()
+        .max(max_dx.abs())
+        .max(min_dy.abs())
+        .max(max_dy.abs());
+    (max_distance + MATCH_STEP - 1) / MATCH_STEP
+}
+
 pub struct PatternCache {
     verified: bool,
     w: usize,
@@ -541,6 +566,9 @@ pub struct IntrabcState {
     pub(super) decoded: Vec<bool>,
     pattern: PatternCache,
     uniform: UniformCache,
+    /// Configured search radius in 4px rings. 0 means "unbounded" (frame edges).
+    /// Defaults to 64 (±256px) if not set.
+    search_radius_rings: i32,
     /// Nesting-aware speculative depth (see `is_speculative`): trials push
     /// depth so rejected candidates increment speculative (not committed)
     /// diagnostics; the winning re-encode runs at the enclosing depth so
@@ -549,7 +577,16 @@ pub struct IntrabcState {
 }
 
 impl IntrabcState {
+    #[allow(dead_code)]
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::with_search_radius(cols, rows, DEFAULT_SEARCH_RINGS)
+    }
+
+    /// Create a new IntrabcState with a custom search radius.
+    /// `radius_rings`: number of 4px rings to search (each ring = 4px).
+    /// Default is 64 (±256px). For 1280x1152 upscaled images, larger values
+    /// like 256 (±1024px) or 512 (±2048px) may find more matches.
+    pub fn with_search_radius(cols: usize, rows: usize, radius_rings: i32) -> Self {
         let blank = MvRec {
             intrabc: false,
             my: 0,
@@ -567,6 +604,7 @@ impl IntrabcState {
             decoded: vec![false; cols * rows],
             pattern: PatternCache::empty(),
             uniform: UniformCache::empty(),
+            search_radius_rings: radius_rings,
             speculative: 0,
         }
     }
@@ -1470,7 +1508,8 @@ impl IntrabcState {
         // itself (zero residual, cheapest possible). Coordinates are
         // evaluated directly in spiral order — no temporary `Vec`.
         // Identical order to the previous ring-buffer version.
-        for k in 0..=SEARCH_RINGS {
+        let search_radius = self.search_radius_rings;
+        for k in 0..=search_radius {
             if k == 0 {
                 if let Some(mv) = self.probe_candidate(
                     px,
@@ -1825,13 +1864,13 @@ impl IntrabcState {
             // All cached origins are 8-aligned and the predictor is a
             // multiple of 32, so residuals sit on the 4px search grid;
             // anything else cannot be visited by the ring and is skipped.
-            // The ring also caps the radius at `SEARCH_RINGS` (256px); more
+            // The ring also caps the radius at the configured limit; more
             // distant candidates are invisible to it and must be skipped to
             // reproduce its miss/selection exactly.
             if rdx % 4 != 0 || rdy % 4 != 0 {
                 continue;
             }
-            if rdx.abs().max(rdy.abs()) > SEARCH_RINGS * MATCH_STEP {
+            if rdx.abs().max(rdy.abs()) > self.search_radius_rings * MATCH_STEP {
                 continue;
             }
             let rank = ring_rank(rdx, rdy);

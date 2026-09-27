@@ -79,6 +79,11 @@ struct Args {
     /// Policy for the unused second color in flat palette blocks.
     #[arg(long, value_enum, default_value = "baseline")]
     flat_pad_policy: FlatPadPolicyArg,
+    /// IntraBC search radius in 4px rings (each ring = 4px).
+    /// Default: 64 (±256px). For 1280x1152 upscaled images, larger values
+    /// like 256 (±1024px) or 512 (±2048px) may find more matches.
+    #[arg(long, default_value = "64")]
+    intrabc_search_radius: i32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -538,6 +543,7 @@ fn run(args: Args) -> Result<(), String> {
             LARGE_W,
             LARGE_H,
             flat_pad_policy,
+            args.intrabc_search_radius,
         )
         .map_err(|e| {
                 format!(

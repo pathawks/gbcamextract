@@ -1016,9 +1016,11 @@ impl<'a> TileEncoder<'a> {
             src_masks,
             use_rdo,
             FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_rdo_and_pad_policy(
         px: &'a [u8],
         w: usize,
@@ -1027,6 +1029,7 @@ impl<'a> TileEncoder<'a> {
         src_masks: Option<Vec<u8>>,
         use_rdo: bool,
         flat_pad_policy: FlatPadPolicy,
+        search_radius_rings: i32,
     ) -> io::Result<Self> {
         if w > u32::MAX as usize || h > u32::MAX as usize {
             return Err(invalid_input(format!(
@@ -1040,7 +1043,8 @@ impl<'a> TileEncoder<'a> {
         let mi_area = mi_cols.checked_mul(mi_rows).ok_or_else(|| {
             invalid_input(format!("MI grid area overflows usize: {mi_cols}x{mi_rows}"))
         })?;
-        let mut intrabc = use_intrabc.then(|| IntrabcState::new(mi_cols, mi_rows));
+        let mut intrabc = use_intrabc
+            .then(|| IntrabcState::with_search_radius(mi_cols, mi_rows, search_radius_rings));
         // Verify the 8x nearest-neighbor invariant once per image and
         // precompute the bounded per-key lists when it holds. Unverified
         // images keep the original ring behavior exactly.
@@ -3372,7 +3376,13 @@ fn frame_header_bits(w: u32, h: u32, allow_intrabc: bool) -> io::Result<Vec<u8>>
 /// Validates dimensions, checked area, buffer length, and supported
 /// colors at the boundary, returning `InvalidInput` instead of panicking.
 fn encode_obu_payload(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
-    encode_obu_payload_with_policy(gray, w, h, FlatPadPolicy::Baseline)
+    encode_obu_payload_with_policy(
+        gray,
+        w,
+        h,
+        FlatPadPolicy::Baseline,
+        intrabc::DEFAULT_SEARCH_RINGS,
+    )
 }
 
 fn encode_obu_payload_with_policy(
@@ -3380,14 +3390,34 @@ fn encode_obu_payload_with_policy(
     w: u32,
     h: u32,
     flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
-        return encode_obu_payload_with_policy_and_intrabc(gray, w, h, false, flat_pad_policy);
+        return encode_obu_payload_with_policy_and_intrabc(
+            gray,
+            w,
+            h,
+            false,
+            flat_pad_policy,
+            search_radius_rings,
+        );
     }
-    let (on_payload, on_av1c) =
-        encode_obu_payload_with_policy_and_intrabc(gray, w, h, true, flat_pad_policy)?;
-    let (off_payload, off_av1c) =
-        encode_obu_payload_with_policy_and_intrabc(gray, w, h, false, flat_pad_policy)?;
+    let (on_payload, on_av1c) = encode_obu_payload_with_policy_and_intrabc(
+        gray,
+        w,
+        h,
+        true,
+        flat_pad_policy,
+        search_radius_rings,
+    )?;
+    let (off_payload, off_av1c) = encode_obu_payload_with_policy_and_intrabc(
+        gray,
+        w,
+        h,
+        false,
+        flat_pad_policy,
+        search_radius_rings,
+    )?;
     if on_payload.len() <= off_payload.len() {
         Ok((on_payload, on_av1c))
     } else {
@@ -3402,7 +3432,14 @@ fn encode_obu_payload_with(
     h: u32,
     use_intrabc: bool,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
-    encode_obu_payload_with_policy_and_intrabc(gray, w, h, use_intrabc, FlatPadPolicy::Baseline)
+    encode_obu_payload_with_policy_and_intrabc(
+        gray,
+        w,
+        h,
+        use_intrabc,
+        FlatPadPolicy::Baseline,
+        intrabc::DEFAULT_SEARCH_RINGS,
+    )
 }
 
 fn encode_obu_payload_with_policy_and_intrabc(
@@ -3411,6 +3448,7 @@ fn encode_obu_payload_with_policy_and_intrabc(
     h: u32,
     use_intrabc: bool,
     flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
 
@@ -3422,6 +3460,7 @@ fn encode_obu_payload_with_policy_and_intrabc(
         masks,
         false,
         flat_pad_policy,
+        search_radius_rings,
     )?;
     let tile_data = tile.finish()?;
 
@@ -3452,7 +3491,14 @@ fn encode_obu_payload_with_rdo(
     h: u32,
     use_intrabc: bool,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
-    encode_obu_payload_with_rdo_and_pad_policy(gray, w, h, use_intrabc, FlatPadPolicy::Baseline)
+    encode_obu_payload_with_rdo_and_pad_policy(
+        gray,
+        w,
+        h,
+        use_intrabc,
+        FlatPadPolicy::Baseline,
+        intrabc::DEFAULT_SEARCH_RINGS,
+    )
 }
 
 fn encode_obu_payload_with_rdo_and_pad_policy(
@@ -3461,6 +3507,7 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
     h: u32,
     use_intrabc: bool,
     flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
     let tile = TileEncoder::new_with_rdo_and_pad_policy(
@@ -3471,6 +3518,7 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
         masks,
         true,
         flat_pad_policy,
+        search_radius_rings,
     )?;
     let tile_data = tile.finish()?;
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
@@ -3488,7 +3536,13 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
 /// and split at every contained node, so no separate on/off picking is
 /// needed; when disabled only the palette-only RDO runs.
 fn encode_obu_payload_rdo(gray: &[u8], w: u32, h: u32) -> io::Result<(Vec<u8>, [u8; 4])> {
-    encode_obu_payload_rdo_with_policy(gray, w, h, FlatPadPolicy::Baseline)
+    encode_obu_payload_rdo_with_policy(
+        gray,
+        w,
+        h,
+        FlatPadPolicy::Baseline,
+        intrabc::DEFAULT_SEARCH_RINGS,
+    )
 }
 
 fn encode_obu_payload_rdo_with_policy(
@@ -3496,11 +3550,26 @@ fn encode_obu_payload_rdo_with_policy(
     w: u32,
     h: u32,
     flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
-        return encode_obu_payload_with_rdo_and_pad_policy(gray, w, h, false, flat_pad_policy);
+        return encode_obu_payload_with_rdo_and_pad_policy(
+            gray,
+            w,
+            h,
+            false,
+            flat_pad_policy,
+            search_radius_rings,
+        );
     }
-    encode_obu_payload_with_rdo_and_pad_policy(gray, w, h, true, flat_pad_policy)
+    encode_obu_payload_with_rdo_and_pad_policy(
+        gray,
+        w,
+        h,
+        true,
+        flat_pad_policy,
+        search_radius_rings,
+    )
 }
 
 fn av01_item(id: u32, w: u32, h: u32, payload: Vec<u8>, av1c: [u8; 4]) -> Item {
@@ -3623,12 +3692,21 @@ pub fn encode_gray_pair(
     lw: u32,
     lh: u32,
 ) -> io::Result<Vec<u8>> {
-    encode_gray_pair_with_pad_policy(small, sw, sh, large, lw, lh, FlatPadPolicy::Baseline)
+    encode_gray_pair_with_pad_policy(
+        small,
+        sw,
+        sh,
+        large,
+        lw,
+        lh,
+        FlatPadPolicy::Baseline,
+        intrabc::DEFAULT_SEARCH_RINGS,
+    )
 }
 
-/// `encode_gray_pair` with an explicit flat-block padding policy. This is
-/// exposed for the bounded look-ahead experiment; the default API remains
-/// byte-identical to the historical policy.
+/// `encode_gray_pair` with an explicit flat-block padding policy and IntraBC search radius.
+/// This is exposed for experiments; the default API remains byte-identical to the historical policy.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_gray_pair_with_pad_policy(
     small: &[u8],
     sw: u32,
@@ -3637,13 +3715,22 @@ pub fn encode_gray_pair_with_pad_policy(
     lw: u32,
     lh: u32,
     flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
 ) -> io::Result<Vec<u8>> {
-    let base_small = encode_obu_payload_with_policy(small, sw, sh, flat_pad_policy)?;
-    let base_large = encode_obu_payload_with_policy(large, lw, lh, flat_pad_policy)?;
+    let base_small =
+        encode_obu_payload_with_policy(small, sw, sh, flat_pad_policy, search_radius_rings)?;
+    let base_large =
+        encode_obu_payload_with_policy(large, lw, lh, flat_pad_policy, search_radius_rings)?;
     // Preserve the whole-file baseline safeguard, but make the RDO choice
     // independently for each item using only payloads already encoded.
     let mut had_rdo_error = false;
-    let rdo_small = match encode_obu_payload_rdo_with_policy(small, sw, sh, flat_pad_policy) {
+    let rdo_small = match encode_obu_payload_rdo_with_policy(
+        small,
+        sw,
+        sh,
+        flat_pad_policy,
+        search_radius_rings,
+    ) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
             had_rdo_error = true;
@@ -3651,7 +3738,13 @@ pub fn encode_gray_pair_with_pad_policy(
             None
         }
     };
-    let rdo_large = match encode_obu_payload_rdo_with_policy(large, lw, lh, flat_pad_policy) {
+    let rdo_large = match encode_obu_payload_rdo_with_policy(
+        large,
+        lw,
+        lh,
+        flat_pad_policy,
+        search_radius_rings,
+    ) {
         Ok(candidate) => Some(candidate),
         Err(_) => {
             had_rdo_error = true;
@@ -4273,6 +4366,7 @@ mod tests {
             Some(masks.clone()),
             false,
             FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
         )
         .unwrap();
         encode_first(&mut baseline);
@@ -4286,6 +4380,7 @@ mod tests {
             Some(masks),
             false,
             FlatPadPolicy::Lookahead,
+            intrabc::DEFAULT_SEARCH_RINGS,
         )
         .unwrap();
         encode_first(&mut lookahead);
@@ -4314,6 +4409,7 @@ mod tests {
             Some(masks),
             false,
             FlatPadPolicy::Lookahead,
+            intrabc::DEFAULT_SEARCH_RINGS,
         )
         .unwrap();
 
@@ -4352,6 +4448,7 @@ mod tests {
                     h as u32,
                     use_intrabc,
                     policy,
+                    intrabc::DEFAULT_SEARCH_RINGS,
                 )
                 .unwrap();
                 let repeated = encode_obu_payload_with_policy_and_intrabc(
@@ -4360,6 +4457,7 @@ mod tests {
                     h as u32,
                     use_intrabc,
                     policy,
+                    intrabc::DEFAULT_SEARCH_RINGS,
                 )
                 .unwrap();
                 assert_eq!(
@@ -4373,6 +4471,7 @@ mod tests {
                     h as u32,
                     use_intrabc,
                     policy,
+                    intrabc::DEFAULT_SEARCH_RINGS,
                 )
                 .unwrap();
                 let repeated_rdo = encode_obu_payload_with_rdo_and_pad_policy(
@@ -4381,6 +4480,7 @@ mod tests {
                     h as u32,
                     use_intrabc,
                     policy,
+                    intrabc::DEFAULT_SEARCH_RINGS,
                 )
                 .unwrap();
                 assert_eq!(
@@ -4410,6 +4510,7 @@ mod tests {
             Some(masks),
             true,
             FlatPadPolicy::Lookahead,
+            intrabc::DEFAULT_SEARCH_RINGS,
         )
         .unwrap();
         let before = (
