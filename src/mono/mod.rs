@@ -36,10 +36,12 @@ use gamut_bitstream::{write_leb128, BitWriter, SymbolEncoder};
 use gamut_isobmff::{
     write as write_isobmff, EntityGroup, IsoBmffImage, Item, Property, PropertyKind,
 };
+use std::collections::HashMap;
 use std::io;
 use std::ops::{Deref, DerefMut};
 
 mod intrabc;
+mod residual;
 pub use intrabc::UniformSearchStats;
 use intrabc::{IntrabcState, MatchShortlist, MvComp, MvRec, UniformDecision, MOTION_SHORTLIST_MAX};
 
@@ -336,6 +338,7 @@ const MAX_PLAN_NODES: usize = 21;
 enum PlanDecision {
     Palette,
     Copy(BcMatch, bool),
+    Residual(u8),
     Split,
 }
 
@@ -433,9 +436,124 @@ const PARTITION_W16: [[u16; 10]; 4] = [
 /// `Default_Skip_Cdf`, indexed [ctx].
 const SKIP: [[u16; 2]; 3] = [[31671, 32768], [16515, 32768], [4576, 32768]];
 
-/// `Default_Kf_Y_Mode_Cdf[0][0]` — the only row used (all neighbours are DC).
-const INTRA_Y_DC_ROW: [u16; 13] = [
-    15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165, 29093, 30466, 32768,
+// Default_Kf_Y_Mode_Cdf[5][5][13], transcribed from pinned libaom 3.11.0
+// vendor/av1/common/entropymode.c. The source carries the BSD 2-Clause License
+// and Alliance for Open Media Patent License 1.0; this table is AV1 §9.4 data.
+const KF_Y_MODE_CDF: [[[u16; 13]; 5]; 5] = [
+    [
+        [
+            15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165, 29093, 30466,
+            32768,
+        ],
+        [
+            12016, 18066, 19516, 20303, 20719, 21444, 21888, 23032, 24434, 28658, 30172, 31409,
+            32768,
+        ],
+        [
+            10052, 10771, 22296, 22788, 23055, 23239, 24133, 25620, 26160, 29336, 29929, 31567,
+            32768,
+        ],
+        [
+            14091, 15406, 16442, 18808, 19136, 19546, 19998, 22096, 24746, 29585, 30958, 32462,
+            32768,
+        ],
+        [
+            12122, 13265, 15603, 16501, 18609, 20033, 22391, 25583, 26437, 30261, 31073, 32475,
+            32768,
+        ],
+    ],
+    [
+        [
+            10023, 19585, 20848, 21440, 21832, 22760, 23089, 24023, 25381, 29014, 30482, 31436,
+            32768,
+        ],
+        [
+            5983, 24099, 24560, 24886, 25066, 25795, 25913, 26423, 27610, 29905, 31276, 31794,
+            32768,
+        ],
+        [
+            7444, 12781, 20177, 20728, 21077, 21607, 22170, 23405, 24469, 27915, 29090, 30492,
+            32768,
+        ],
+        [
+            8537, 14689, 15432, 17087, 17408, 18172, 18408, 19825, 24649, 29153, 31096, 32210,
+            32768,
+        ],
+        [
+            7543, 14231, 15496, 16195, 17905, 20717, 21984, 24516, 26001, 29675, 30981, 31994,
+            32768,
+        ],
+    ],
+    [
+        [
+            12613, 13591, 21383, 22004, 22312, 22577, 23401, 25055, 25729, 29538, 30305, 32077,
+            32768,
+        ],
+        [
+            9687, 13470, 18506, 19230, 19604, 20147, 20695, 22062, 23219, 27743, 29211, 30907,
+            32768,
+        ],
+        [
+            6183, 6505, 26024, 26252, 26366, 26434, 27082, 28354, 28555, 30467, 30794, 32086, 32768,
+        ],
+        [
+            10718, 11734, 14954, 17224, 17565, 17924, 18561, 21523, 23878, 28975, 30287, 32252,
+            32768,
+        ],
+        [
+            9194, 9858, 16501, 17263, 18424, 19171, 21563, 25961, 26561, 30072, 30737, 32463, 32768,
+        ],
+    ],
+    [
+        [
+            12602, 14399, 15488, 18381, 18778, 19315, 19724, 21419, 25060, 29696, 30917, 32409,
+            32768,
+        ],
+        [
+            8203, 13821, 14524, 17105, 17439, 18131, 18404, 19468, 25225, 29485, 31158, 32342,
+            32768,
+        ],
+        [
+            8451, 9731, 15004, 17643, 18012, 18425, 19070, 21538, 24605, 29118, 30078, 32018, 32768,
+        ],
+        [
+            7714, 9048, 9516, 16667, 16817, 16994, 17153, 18767, 26743, 30389, 31536, 32528, 32768,
+        ],
+        [
+            8843, 10280, 11496, 15317, 16652, 17943, 19108, 22718, 25769, 29953, 30983, 32485,
+            32768,
+        ],
+    ],
+    [
+        [
+            12578, 13671, 15979, 16834, 19075, 20913, 22989, 25449, 26219, 30214, 31150, 32477,
+            32768,
+        ],
+        [
+            9563, 13626, 15080, 15892, 17756, 20863, 22207, 24236, 25380, 29653, 31143, 32277,
+            32768,
+        ],
+        [
+            8356, 8901, 17616, 18256, 19350, 20106, 22598, 25947, 26466, 29900, 30523, 32261, 32768,
+        ],
+        [
+            10835, 11815, 13124, 16042, 17018, 18039, 18947, 22753, 24615, 29489, 30883, 32482,
+            32768,
+        ],
+        [
+            7618, 8288, 9859, 10509, 15386, 18657, 22903, 28776, 29180, 31355, 31802, 32593, 32768,
+        ],
+    ],
+];
+const INTRA_Y_DC_ROW: [u16; 13] = KF_Y_MODE_CDF[0][0];
+const INTRA_MODE_CONTEXT: [usize; 13] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+const V_PRED: u8 = 1;
+const H_PRED: u8 = 2;
+const PAETH_PRED: u8 = 12;
+const RESIDUAL_INTRA_MODES: [u8; 4] = [DC_PRED as u8, V_PRED, H_PRED, PAETH_PRED];
+const ANGLE_DELTA_CDF: [[u16; 7]; 2] = [
+    [2180, 5032, 7567, 22776, 26989, 30217, 32768],
+    [2301, 5608, 8801, 23487, 26974, 30330, 32768],
 ];
 
 /// `Default_Palette_Y_Mode_Cdf`, rows for the block sizes we emit,
@@ -509,6 +627,470 @@ const GAME_SHADES: [u8; 4] = [0, 85, 170, 255];
 
 /// Gray value → shade index 0..3, 0xFF for unsupported values.
 const GRAY_TO_SHADE: [u8; 256] = build_gray_to_shade();
+
+/// The 256 possible 2x2 source-shade patterns represented by one 16x16
+/// region in the verified 8x raster. Each entry stores four shade indices
+/// in row-major order; transform templates are further keyed by both edge
+/// samples and their availability.
+const SCALED_PATTERN_SHADES: [[u8; 4]; 256] = build_scaled_pattern_shades();
+
+const fn build_scaled_pattern_shades() -> [[u8; 4]; 256] {
+    let mut patterns = [[0u8; 4]; 256];
+    let mut pattern = 0usize;
+    while pattern < 256 {
+        let mut cell = 0usize;
+        while cell < 4 {
+            patterns[pattern][cell] = ((pattern >> (cell * 2)) & 3) as u8;
+            cell += 1;
+        }
+        pattern += 1;
+    }
+    patterns
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ResidualPatternKey {
+    pattern: u8,
+    mode: u8,
+    top: [u8; 2],
+    left: [u8; 2],
+    top_left: u8,
+    have_top: bool,
+    have_left: bool,
+    have_top_left: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResidualPatternTemplate {
+    predictor: [[u8; 16]; 16],
+    coefficients: [[i32; 16]; 16],
+}
+
+fn make_residual_pattern_template(key: ResidualPatternKey) -> ResidualPatternTemplate {
+    let pattern = SCALED_PATTERN_SHADES[key.pattern as usize];
+    let mut template = ResidualPatternTemplate {
+        predictor: [[0; 16]; 16],
+        coefficients: [[0; 16]; 16],
+    };
+    for ty in 0..4 {
+        for tx in 0..4 {
+            let index = ty * 4 + tx;
+            let source_shade = pattern[(ty / 2) * 2 + tx / 2];
+            let predictors = residual_pattern_predictor(key, tx, ty);
+            template.predictor[index] = predictors;
+            let residual_pixels = std::array::from_fn(|pixel| {
+                i32::from(GAME_SHADES[source_shade as usize]) - i32::from(predictors[pixel])
+            });
+            template.coefficients[index] = residual::forward_wht4x4(&residual_pixels);
+        }
+    }
+    template
+}
+
+fn residual_pattern_predictor(key: ResidualPatternKey, tx: usize, ty: usize) -> [u8; 16] {
+    let pattern = SCALED_PATTERN_SHADES[key.pattern as usize];
+    let above_shade = if ty > 0 {
+        Some(pattern[((ty - 1) / 2) * 2 + tx / 2])
+    } else if key.have_top {
+        Some(key.top[tx / 2])
+    } else if tx > 0 || key.have_left {
+        Some(if tx > 0 {
+            pattern[(ty / 2) * 2 + (tx - 1) / 2]
+        } else {
+            key.left[ty / 2]
+        })
+    } else {
+        None
+    };
+    let left_shade = if tx > 0 {
+        Some(pattern[(ty / 2) * 2 + (tx - 1) / 2])
+    } else if key.have_left {
+        Some(key.left[ty / 2])
+    } else {
+        None
+    };
+    let above = [above_shade.map_or(127, |shade| GAME_SHADES[shade as usize]); 4];
+    let left = [left_shade.map_or_else(
+        || above_shade.map_or(129, |shade| GAME_SHADES[shade as usize]),
+        |shade| GAME_SHADES[shade as usize],
+    ); 4];
+    let top_left = if above_shade.is_some() && left_shade.is_some() {
+        if ty > 0 && tx > 0 {
+            GAME_SHADES[pattern[((ty - 1) / 2) * 2 + (tx - 1) / 2] as usize]
+        } else if ty > 0 && key.have_left {
+            GAME_SHADES[key.left[(ty - 1) / 2] as usize]
+        } else if ty > 0 {
+            GAME_SHADES[pattern[((ty - 1) / 2) * 2 + tx / 2] as usize]
+        } else if tx > 0 {
+            if key.have_top {
+                GAME_SHADES[key.top[(tx - 1) / 2] as usize]
+            } else {
+                GAME_SHADES[pattern[(ty / 2) * 2 + (tx - 1) / 2] as usize]
+            }
+        } else if key.have_top_left {
+            GAME_SHADES[key.top_left as usize]
+        } else if key.have_top {
+            GAME_SHADES[key.top[tx / 2] as usize]
+        } else if key.have_left {
+            GAME_SHADES[key.left[ty / 2] as usize]
+        } else {
+            128
+        }
+    } else if above_shade.is_some() {
+        above[0]
+    } else if left_shade.is_some() {
+        left[0]
+    } else {
+        128
+    };
+
+    let mut prediction = [0; 16];
+    for y in 0..4 {
+        for x in 0..4 {
+            prediction[y * 4 + x] = match key.mode as usize {
+                DC_PRED => {
+                    let have_above = ty > 0 || key.have_top;
+                    let have_left = tx > 0 || key.have_left;
+                    match (have_above, have_left) {
+                        (true, true) => {
+                            let sum = above.iter().map(|&sample| u32::from(sample)).sum::<u32>()
+                                + left.iter().map(|&sample| u32::from(sample)).sum::<u32>();
+                            ((sum + 4) / 8) as u8
+                        }
+                        (true, false) => {
+                            ((above.iter().map(|&sample| u32::from(sample)).sum::<u32>() + 2) / 4)
+                                as u8
+                        }
+                        (false, true) => {
+                            ((left.iter().map(|&sample| u32::from(sample)).sum::<u32>() + 2) / 4)
+                                as u8
+                        }
+                        (false, false) => 128,
+                    }
+                }
+                mode if mode == usize::from(V_PRED) => above[x],
+                mode if mode == usize::from(H_PRED) => left[y],
+                mode if mode == usize::from(PAETH_PRED) => {
+                    let top = i32::from(above[x]);
+                    let side = i32::from(left[y]);
+                    let corner = i32::from(top_left);
+                    let base = top + side - corner;
+                    let d_left = (base - side).abs();
+                    let d_top = (base - top).abs();
+                    let d_corner = (base - corner).abs();
+                    if d_left <= d_top && d_left <= d_corner {
+                        left[y]
+                    } else if d_top <= d_corner {
+                        above[x]
+                    } else {
+                        top_left
+                    }
+                }
+                _ => unreachable!("unsupported residual prediction mode {}", key.mode),
+            };
+        }
+    }
+    prediction
+}
+
+#[cfg(test)]
+mod residual_pattern_tests {
+    use super::*;
+
+    fn reference_predictor(px: &[u8], width: usize, x: usize, y: usize, mode: u8) -> [u8; 16] {
+        let have_top = y > 0;
+        let have_left = x > 0;
+        let above = if have_top {
+            std::array::from_fn(|i| px[(y - 1) * width + x + i])
+        } else if have_left {
+            [px[y * width + x - 1]; 4]
+        } else {
+            [127; 4]
+        };
+        let left = if have_left {
+            std::array::from_fn(|i| px[(y + i) * width + x - 1])
+        } else if have_top {
+            [px[(y - 1) * width + x]; 4]
+        } else {
+            [129; 4]
+        };
+        let top_left = if have_top && have_left {
+            px[(y - 1) * width + x - 1]
+        } else if have_top {
+            px[(y - 1) * width + x]
+        } else if have_left {
+            px[y * width + x - 1]
+        } else {
+            128
+        };
+        let mut prediction = [0; 16];
+        for row in 0..4 {
+            for col in 0..4 {
+                prediction[row * 4 + col] = match mode {
+                    mode if mode == DC_PRED as u8 => match (have_top, have_left) {
+                        (true, true) => {
+                            let sum = above
+                                .iter()
+                                .chain(left.iter())
+                                .map(|&v| u32::from(v))
+                                .sum::<u32>();
+                            ((sum + 4) / 8) as u8
+                        }
+                        (true, false) => {
+                            ((above.iter().map(|&v| u32::from(v)).sum::<u32>() + 2) / 4) as u8
+                        }
+                        (false, true) => {
+                            ((left.iter().map(|&v| u32::from(v)).sum::<u32>() + 2) / 4) as u8
+                        }
+                        (false, false) => 128,
+                    },
+                    V_PRED => above[col],
+                    H_PRED => left[row],
+                    PAETH_PRED => {
+                        let top = i32::from(above[col]);
+                        let side = i32::from(left[row]);
+                        let corner = i32::from(top_left);
+                        let base = top + side - corner;
+                        let d_left = (base - side).abs();
+                        let d_top = (base - top).abs();
+                        let d_corner = (base - corner).abs();
+                        if d_left <= d_top && d_left <= d_corner {
+                            left[row]
+                        } else if d_top <= d_corner {
+                            above[col]
+                        } else {
+                            top_left
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+            }
+        }
+        prediction
+    }
+
+    #[test]
+    fn scaled_pattern_templates_cover_all_patterns_modes_and_image_edges() {
+        let modes = [DC_PRED as u8, V_PRED, H_PRED, PAETH_PRED];
+        let contexts = [
+            (48usize, 48usize, 16usize, 16usize, true, true, true),
+            (32, 16, 16, 0, false, true, false),
+            (16, 32, 0, 16, true, false, false),
+            (16, 16, 0, 0, false, false, false),
+        ];
+        for pattern_id in 0..=u8::MAX {
+            let pattern = SCALED_PATTERN_SHADES[pattern_id as usize];
+            for (width, height, block_x, block_y, have_top, have_left, have_top_left) in contexts {
+                for mode in modes {
+                    let top = [3u8, 2];
+                    let left = [1u8, 0];
+                    let top_left = 2u8;
+                    let key = ResidualPatternKey {
+                        pattern: pattern_id,
+                        mode,
+                        top,
+                        left,
+                        top_left,
+                        have_top,
+                        have_left,
+                        have_top_left,
+                    };
+                    let mut pixels = vec![0u8; width * height];
+                    if have_top {
+                        for x in 0..16 {
+                            pixels[(block_y - 1) * width + block_x + x] =
+                                GAME_SHADES[top[x / 8] as usize];
+                        }
+                    }
+                    if have_left {
+                        for y in 0..16 {
+                            pixels[(block_y + y) * width + block_x - 1] =
+                                GAME_SHADES[left[y / 8] as usize];
+                        }
+                    }
+                    if have_top_left {
+                        pixels[(block_y - 1) * width + block_x - 1] =
+                            GAME_SHADES[top_left as usize];
+                    }
+                    for source_y in 0..2 {
+                        for source_x in 0..2 {
+                            let shade = GAME_SHADES[pattern[source_y * 2 + source_x] as usize];
+                            for y in 0..8 {
+                                let row = (block_y + source_y * 8 + y) * width;
+                                pixels[row + block_x + source_x * 8
+                                    ..row + block_x + (source_x + 1) * 8]
+                                    .fill(shade);
+                            }
+                        }
+                    }
+
+                    let template = make_residual_pattern_template(key);
+                    for ty in 0..4 {
+                        for tx in 0..4 {
+                            let x = block_x + tx * 4;
+                            let y = block_y + ty * 4;
+                            let index = ty * 4 + tx;
+                            let expected = reference_predictor(&pixels, width, x, y, mode);
+                            let predictor = template.predictor[index];
+                            assert_eq!(
+                                predictor, expected,
+                                "pattern {pattern_id}, mode {mode}, edges ({have_top},{have_left}), TX ({tx},{ty})"
+                            );
+                            let mut residual_pixels = [0i32; 16];
+                            for dy in 0..4 {
+                                for dx in 0..4 {
+                                    residual_pixels[dy * 4 + dx] =
+                                        i32::from(pixels[(y + dy) * width + x + dx])
+                                            - i32::from(expected[dy * 4 + dx]);
+                                }
+                            }
+                            let coefficients = residual::forward_wht4x4(&residual_pixels);
+                            assert_eq!(
+                                template.coefficients[index], coefficients,
+                                "pattern {pattern_id}, mode {mode}"
+                            );
+                            let reconstructed =
+                                residual::inverse_wht4x4(&template.coefficients[index]);
+                            for (k, (source, residual)) in pixels
+                                .chunks_exact(width)
+                                .skip(y)
+                                .take(4)
+                                .flat_map(|row| row[x..x + 4].iter())
+                                .zip(reconstructed)
+                                .enumerate()
+                            {
+                                assert_eq!(i32::from(*source), i32::from(expected[k]) + residual);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_pattern_cache_key_includes_edges_and_availability() {
+        let base = ResidualPatternKey {
+            pattern: 0b11_10_01_00,
+            mode: DC_PRED as u8,
+            top: [0, 1],
+            left: [2, 3],
+            top_left: 1,
+            have_top: true,
+            have_left: true,
+            have_top_left: true,
+        };
+        let mut cache = HashMap::new();
+        for key in [
+            base,
+            ResidualPatternKey {
+                top: [1, 1],
+                ..base
+            },
+            ResidualPatternKey {
+                left: [3, 3],
+                ..base
+            },
+            ResidualPatternKey {
+                have_top: false,
+                ..base
+            },
+            ResidualPatternKey {
+                have_left: false,
+                ..base
+            },
+            ResidualPatternKey {
+                mode: PAETH_PRED,
+                ..base
+            },
+            ResidualPatternKey {
+                top_left: 0,
+                ..base
+            },
+            ResidualPatternKey {
+                have_top_left: false,
+                ..base
+            },
+        ] {
+            cache
+                .entry(key)
+                .or_insert_with(|| make_residual_pattern_template(key));
+        }
+        assert_eq!(cache.len(), 8);
+    }
+
+    #[test]
+    fn scaled_pattern_cache_enumerates_every_domain_pattern_and_mode() {
+        use std::time::Instant;
+
+        let (source_width, source_height) = (32usize, 32usize);
+        let (width, height) = (256usize, 256usize);
+        let mut small = vec![0u8; source_width * source_height];
+        for pattern_id in 0..256usize {
+            let (region_x, region_y) = (pattern_id % 16, pattern_id / 16);
+            for y in 0..2 {
+                for x in 0..2 {
+                    let shade = (pattern_id >> ((y * 2 + x) * 2)) & 3;
+                    small[(region_y * 2 + y) * source_width + region_x * 2 + x] =
+                        GAME_SHADES[shade];
+                }
+            }
+        }
+        let mut scaled = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                scaled[y * width + x] = small[(y / 8) * source_width + x / 8];
+            }
+        }
+        assert!(verify_residual_pair(
+            &small,
+            source_width as u32,
+            source_height as u32,
+            &scaled,
+            width as u32,
+            height as u32
+        )
+        .unwrap());
+        let (_, masks) = validate_gray(&scaled, width as u32, height as u32).unwrap();
+        let mut tile =
+            TileEncoder::new_with_rdo(&scaled, width, height, false, masks, true).unwrap();
+        tile.enable_residual_profile(true);
+
+        let started = Instant::now();
+        let mut candidate_trials = 0usize;
+        let mut exact_prediction_skips = 0usize;
+        for pattern_y in 0..16 {
+            for pattern_x in 0..16 {
+                let (r, c) = (pattern_y * 4, pattern_x * 4);
+                for mode in RESIDUAL_INTRA_MODES {
+                    candidate_trials += 1;
+                    exact_prediction_skips +=
+                        usize::from(tile.residual_block_is_exact_prediction(r, c, 4, mode));
+                    tile.trial(r, c, 4, 4, |enc| enc.encode_residual_block(r, c, 2, mode))
+                        .unwrap();
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(candidate_trials, 256 * RESIDUAL_INTRA_MODES.len());
+        assert_eq!(
+            tile.scaled_pattern_cache.len() + exact_prediction_skips,
+            candidate_trials
+        );
+        let entry_size = std::mem::size_of::<ResidualPatternKey>()
+            + std::mem::size_of::<ResidualPatternTemplate>();
+        eprintln!(
+            "scaled pattern trial coverage: 256 patterns x {} modes = {} candidate trials, {} transform cache entries and {} predictor-exact skips; HashMap capacity {}; value+key bucket estimate {} bytes; template generation {:?}",
+            RESIDUAL_INTRA_MODES.len(),
+            candidate_trials,
+            tile.scaled_pattern_cache.len(),
+            exact_prediction_skips,
+            tile.scaled_pattern_cache.capacity(),
+            tile.scaled_pattern_cache.capacity() * entry_size,
+            elapsed
+        );
+    }
+}
 
 const fn build_gray_to_shade() -> [u8; 256] {
     let mut t = [0xFFu8; 256];
@@ -930,6 +1512,23 @@ impl Cdfs {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ResidualModeCdfs {
+    y_mode: [[AdaptCdf; 5]; 5],
+    angle_delta: [AdaptCdf; 2],
+}
+
+impl Default for ResidualModeCdfs {
+    fn default() -> Self {
+        Self {
+            y_mode: std::array::from_fn(|above| {
+                std::array::from_fn(|left| AdaptCdf::new(&KF_Y_MODE_CDF[above][left]))
+            }),
+            angle_delta: ANGLE_DELTA_CDF.map(|row| AdaptCdf::new(&row)),
+        }
+    }
+}
+
 /// `get_palette_color_context` (§5.11.50): reorder colors by neighbour
 /// score; returns the `ColorOrder` permutation and the index context.
 fn palette_color_context(
@@ -988,12 +1587,25 @@ struct TileEncoder<'a> {
     mi_rows: usize,
     sym: SymbolEncoder,
     cdfs: Cdfs,
+    coeff_cdfs: Option<residual::CoeffCdfs>,
+    residual_mode_cdfs: Option<ResidualModeCdfs>,
     /// `None` disables IntraBC entirely (byte-identical to the pre-IntraBC
     /// encoder: no flag symbols, no header bit — see `USE_INTRABC`).
     intrabc: Option<IntrabcState>,
     skip: Vec<u8>,
     psize: Vec<u8>,
     pcolors: Vec<[u8; 8]>,
+    ymode: Option<Vec<u8>>,
+    above_coeff_level: Vec<u8>,
+    left_coeff_level: Vec<u8>,
+    above_coeff_dc: Vec<u8>,
+    left_coeff_dc: Vec<u8>,
+    /// Pure WHT memoization keyed by the exact residual; it stores no entropy costs.
+    residual_transform_cache: HashMap<[i32; 16], [i32; 16]>,
+    /// Verified 8x image: templates keyed by a 2x2 pattern, mode, and full edge context.
+    scaled_pattern_cache: HashMap<ResidualPatternKey, ResidualPatternTemplate>,
+    residual_profile: bool,
+    scaled_8x_profile: bool,
     above_part: Vec<u8>,
     left_part: Vec<u8>,
     /// Four-shade source masks (`Some` iff every pixel verified in
@@ -1046,6 +1658,8 @@ const AL_PART_NONE_LEFT: [u8; 5] = [0x00, 0x10, 0x18, 0x1c, 0x1e];
 struct Snapshot {
     sym: Option<SymbolEncoder>,
     cdfs: Cdfs,
+    coeff_cdfs: Option<residual::CoeffCdfs>,
+    residual_mode_cdfs: Option<ResidualModeCdfs>,
     intrabc_cdfs: Option<(AdaptCdf, AdaptCdf, [MvComp; 2], u32)>,
     cost: f64,
     cost_only: bool,
@@ -1057,12 +1671,21 @@ struct Snapshot {
     skip_fp: [u8; 256],
     psize_fp: [u8; 256],
     pcolors_fp: [[u8; 8]; 256],
+    ymode_fp: Option<[u8; 256]>,
+    residual_coeff_contexts: Option<ResidualCoeffSnapshot>,
     decoded_fp: [bool; 256],
     rec_fp: [MvRec; 256],
     above_len: usize,
     above_fp: [u8; 16],
     left_len: usize,
     left_fp: [u8; 16],
+}
+
+struct ResidualCoeffSnapshot {
+    above_level: [u8; 16],
+    left_level: [u8; 16],
+    above_dc: [u8; 16],
+    left_dc: [u8; 16],
 }
 
 impl<'a> TileEncoder<'a> {
@@ -1190,10 +1813,21 @@ impl<'a> TileEncoder<'a> {
             mi_rows,
             sym: SymbolEncoder::new(),
             cdfs: Cdfs::new(),
+            coeff_cdfs: None,
+            residual_mode_cdfs: None,
             intrabc,
             skip: vec![0; mi_area],
             psize: vec![0; mi_area],
             pcolors: vec![[0u8; 8]; mi_area],
+            ymode: None,
+            above_coeff_level: vec![0; mi_cols],
+            left_coeff_level: vec![0; mi_rows],
+            above_coeff_dc: vec![0; mi_cols],
+            left_coeff_dc: vec![0; mi_rows],
+            residual_transform_cache: HashMap::new(),
+            scaled_pattern_cache: HashMap::new(),
+            residual_profile: false,
+            scaled_8x_profile: false,
             above_part: vec![0; mi_cols],
             left_part: vec![0; mi_rows],
             src_masks,
@@ -1301,6 +1935,14 @@ impl<'a> TileEncoder<'a> {
         self.use_rdo || self.pad_scoring
     }
 
+    fn enable_residual_profile(&mut self, scaled_8x: bool) {
+        self.residual_profile = true;
+        self.scaled_8x_profile = scaled_8x;
+        self.coeff_cdfs = Some(residual::CoeffCdfs::default());
+        self.residual_mode_cdfs = Some(ResidualModeCdfs::default());
+        self.ymode = Some(vec![DC_PRED as u8; self.mi_cols * self.mi_rows]);
+    }
+
     fn enc_part(&mut self, bsl: usize, ctx: usize, s: usize) {
         if self.count_cost() {
             let bits = adapt_bits(self.cdfs.part_row(bsl, ctx), s);
@@ -1327,15 +1969,77 @@ impl<'a> TileEncoder<'a> {
         }
     }
 
-    fn enc_y_dc(&mut self, s: usize) {
-        if self.count_cost() {
-            let bits = adapt_bits(&self.cdfs.y_dc.cdf, s);
-            self.cost += bits;
-        }
-        if self.cost_only {
-            self.cdfs.y_dc.update(s);
+    fn enc_y_mode(&mut self, r: usize, c: usize, mode: u8) {
+        let symbol = mode as usize;
+        let cost_only = self.cost_only;
+        let use_cost = self.count_cost();
+        if let (Some(grid), Some(cdfs)) = (&self.ymode, &mut self.residual_mode_cdfs) {
+            let above_mode = if r > 0 {
+                grid[(r - 1) * self.mi_cols + c]
+            } else {
+                DC_PRED as u8
+            };
+            let left_mode = if c > 0 {
+                grid[r * self.mi_cols + c - 1]
+            } else {
+                DC_PRED as u8
+            };
+            let above_ctx = INTRA_MODE_CONTEXT[above_mode as usize];
+            let left_ctx = INTRA_MODE_CONTEXT[left_mode as usize];
+            let cdf = &mut cdfs.y_mode[above_ctx][left_ctx];
+            if use_cost {
+                self.cost += adapt_bits(&cdf.cdf, symbol);
+            }
+            if cost_only {
+                cdf.update(symbol);
+            } else {
+                cdf.encode(&mut self.sym, symbol);
+            }
         } else {
-            self.cdfs.y_dc.encode(&mut self.sym, s);
+            debug_assert_eq!(mode, DC_PRED as u8);
+            let cdf = &mut self.cdfs.y_dc;
+            if use_cost {
+                self.cost += adapt_bits(&cdf.cdf, symbol);
+            }
+            if cost_only {
+                cdf.update(symbol);
+            } else {
+                cdf.encode(&mut self.sym, symbol);
+            }
+        }
+    }
+
+    fn enc_angle_delta_zero(&mut self, mode: u8) {
+        if !(V_PRED..=H_PRED).contains(&mode) {
+            return;
+        }
+        let use_cost = self.count_cost();
+        let cost_only = self.cost_only;
+        let Some(mode_cdfs) = self.residual_mode_cdfs.as_mut() else {
+            return;
+        };
+        let cdf = &mut mode_cdfs.angle_delta[(mode - V_PRED) as usize];
+        let symbol = 3; // zero delta, biased by MAX_ANGLE_DELTA
+        if use_cost {
+            self.cost += adapt_bits(&cdf.cdf, symbol);
+        }
+        if cost_only {
+            cdf.update(symbol);
+        } else {
+            cdf.encode(&mut self.sym, symbol);
+        }
+    }
+
+    fn record_y_mode(&mut self, r: usize, c: usize, bw4: usize, bh4: usize, mode: u8) {
+        let Some(grid) = self.ymode.as_mut() else {
+            return;
+        };
+        for y in r..r + bh4 {
+            for x in c..c + bw4 {
+                if y < self.mi_rows && x < self.mi_cols {
+                    grid[y * self.mi_cols + x] = mode;
+                }
+            }
         }
     }
 
@@ -1527,6 +2231,385 @@ impl<'a> TileEncoder<'a> {
         let above = r > 0 && self.skip[(r - 1) * self.mi_cols + c] != 0;
         let left = c > 0 && self.skip[r * self.mi_cols + (c - 1)] != 0;
         usize::from(above) + usize::from(left)
+    }
+
+    fn txb_skip_ctx_4x4(&self, r: usize, c: usize) -> usize {
+        let top = i32::from(self.above_coeff_level[c]);
+        let left = i32::from(self.left_coeff_level[r]);
+        if top == 0 && left == 0 {
+            1
+        } else if top == 0 || left == 0 {
+            2 + usize::from(top.max(left) > 3)
+        } else if top.max(left) <= 3 {
+            4
+        } else if top.min(left) <= 3 {
+            5
+        } else {
+            6
+        }
+    }
+
+    fn dc_sign_ctx_4x4(&self, r: usize, c: usize) -> usize {
+        let signed = |category| match category {
+            1 => -1,
+            2 => 1,
+            _ => 0,
+        };
+        let sum = signed(self.above_coeff_dc[c]) + signed(self.left_coeff_dc[r]);
+        if sum < 0 {
+            1
+        } else if sum > 0 {
+            2
+        } else {
+            0
+        }
+    }
+
+    fn record_coeff_context_4x4(&mut self, r: usize, c: usize, context: residual::CoeffContext) {
+        self.above_coeff_level[c] = context.cul_level;
+        self.left_coeff_level[r] = context.cul_level;
+        self.above_coeff_dc[c] = context.dc_category;
+        self.left_coeff_dc[r] = context.dc_category;
+    }
+
+    fn reset_coeff_context(&mut self, r: usize, c: usize, bw4: usize, bh4: usize) {
+        for x in c..c + bw4 {
+            if x < self.mi_cols {
+                self.above_coeff_level[x] = 0;
+                self.above_coeff_dc[x] = 0;
+            }
+        }
+        for y in r..r + bh4 {
+            if y < self.mi_rows {
+                self.left_coeff_level[y] = 0;
+                self.left_coeff_dc[y] = 0;
+            }
+        }
+    }
+
+    fn scaled_pattern_key(&self, x: usize, y: usize, mode: u8) -> ResidualPatternKey {
+        debug_assert!(x.is_multiple_of(16) && y.is_multiple_of(16));
+        let shade = |sx: usize, sy: usize| {
+            let value = self.sample(sx * 8, sy * 8);
+            let result = GRAY_TO_SHADE[value as usize];
+            debug_assert_ne!(
+                result, 0xFF,
+                "verified profile has unsupported shade {value}"
+            );
+            result
+        };
+        let source_x = x / 8;
+        let source_y = y / 8;
+        let pattern = [
+            shade(source_x, source_y),
+            shade(source_x + 1, source_y),
+            shade(source_x, source_y + 1),
+            shade(source_x + 1, source_y + 1),
+        ];
+        let pattern_id = pattern
+            .iter()
+            .enumerate()
+            .fold(0u8, |packed, (index, &value)| {
+                packed | (value << (index * 2))
+            });
+        let have_top = y > 0;
+        let have_left = x > 0;
+        let have_top_left = have_top && have_left;
+        let top = if have_top {
+            [
+                shade(source_x, source_y - 1),
+                shade(source_x + 1, source_y - 1),
+            ]
+        } else {
+            [0, 0]
+        };
+        let left = if have_left {
+            [
+                shade(source_x - 1, source_y),
+                shade(source_x - 1, source_y + 1),
+            ]
+        } else {
+            [0, 0]
+        };
+        let top_left = if have_top_left {
+            shade(source_x - 1, source_y - 1)
+        } else {
+            0
+        };
+        ResidualPatternKey {
+            pattern: pattern_id,
+            mode,
+            top,
+            left,
+            top_left,
+            have_top,
+            have_left,
+            have_top_left,
+        }
+    }
+
+    fn residual_dc_predictor(&self, x: usize, y: usize) -> u8 {
+        let have_top = y > 0;
+        let have_left = x > 0;
+        match (have_top, have_left) {
+            (true, true) => {
+                let mut sum = 0u32;
+                for offset in 0..4 {
+                    sum += u32::from(self.sample(x + offset, y - 1));
+                    sum += u32::from(self.sample(x - 1, y + offset));
+                }
+                ((sum + 4) / 8) as u8
+            }
+            (true, false) => {
+                let sum = (0..4)
+                    .map(|offset| u32::from(self.sample(x + offset, y - 1)))
+                    .sum::<u32>();
+                ((sum + 2) / 4) as u8
+            }
+            (false, true) => {
+                let sum = (0..4)
+                    .map(|offset| u32::from(self.sample(x - 1, y + offset)))
+                    .sum::<u32>();
+                ((sum + 2) / 4) as u8
+            }
+            (false, false) => 128,
+        }
+    }
+
+    fn residual_predictor_4x4(&self, x: usize, y: usize, mode: u8) -> [u8; 16] {
+        if mode == DC_PRED as u8 {
+            return [self.residual_dc_predictor(x, y); 16];
+        }
+        let have_top = y > 0;
+        let have_left = x > 0;
+        let above = if have_top {
+            std::array::from_fn(|offset| self.sample(x + offset, y - 1))
+        } else if have_left {
+            [self.sample(x - 1, y); 4]
+        } else {
+            [127; 4]
+        };
+        let left = if have_left {
+            std::array::from_fn(|offset| self.sample(x - 1, y + offset))
+        } else if have_top {
+            [self.sample(x, y - 1); 4]
+        } else {
+            [129; 4]
+        };
+        let top_left = if have_top && have_left {
+            self.sample(x - 1, y - 1)
+        } else if have_top {
+            self.sample(x, y - 1)
+        } else if have_left {
+            self.sample(x - 1, y)
+        } else {
+            128
+        };
+        let mut prediction = [0; 16];
+        for row in 0..4 {
+            for col in 0..4 {
+                prediction[row * 4 + col] = match mode {
+                    V_PRED => above[col],
+                    H_PRED => left[row],
+                    PAETH_PRED => {
+                        let top = i32::from(above[col]);
+                        let side = i32::from(left[row]);
+                        let corner = i32::from(top_left);
+                        let base = top + side - corner;
+                        let d_left = (base - side).abs();
+                        let d_top = (base - top).abs();
+                        let d_corner = (base - corner).abs();
+                        if d_left <= d_top && d_left <= d_corner {
+                            left[row]
+                        } else if d_top <= d_corner {
+                            above[col]
+                        } else {
+                            top_left
+                        }
+                    }
+                    _ => unreachable!("unsupported residual intra mode {mode}"),
+                };
+            }
+        }
+        prediction
+    }
+
+    /// AV1 `skip = 1` omits all transform coefficients while still applying
+    /// intra prediction. In qindex-0 mode this is useful only when every
+    /// mandatory 4x4 prediction already equals its source samples.
+    fn residual_block_is_exact_prediction(&self, r: usize, c: usize, bw4: usize, mode: u8) -> bool {
+        let (sx, sy) = (c * 4, r * 4);
+        for tx_y in 0..bw4 {
+            for tx_x in 0..bw4 {
+                let (x, y) = (sx + tx_x * 4, sy + tx_y * 4);
+                let predictor = self.residual_predictor_4x4(x, y, mode);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        if self.sample(x + dx, y + dy) != predictor[dy * 4 + dx] {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Emit a supported coded-lossless luma prediction mode with 4x4 WHT
+    /// residuals. Source neighbors equal decoder reconstruction on this q0
+    /// path. Coefficient and mode CDF costs remain live; only prediction and
+    /// transform math are memoized for verified scaled patterns.
+    fn encode_residual_block(
+        &mut self,
+        r: usize,
+        c: usize,
+        bsl: usize,
+        mode: u8,
+    ) -> io::Result<()> {
+        if !self.residual_profile {
+            return Err(invalid_input(
+                "residual transform candidate requires verified four-shade pixels".to_owned(),
+            ));
+        }
+        if !RESIDUAL_INTRA_MODES.contains(&mode) {
+            return Err(invalid_input(format!(
+                "unsupported residual prediction mode {mode}"
+            )));
+        }
+        let bw4 = 1usize << bsl;
+        let (sx, sy) = (c * 4, r * 4);
+        let exact_prediction = self.residual_block_is_exact_prediction(r, c, bw4, mode);
+        let skip_ctx = self.skip_ctx(r, c);
+        self.enc_skip(skip_ctx, usize::from(exact_prediction));
+
+        let use_cost = self.count_cost();
+        let emit = !self.cost_only;
+        if let Some(bc) = self.intrabc.as_mut() {
+            let (sym, cost) = (&mut self.sym, &mut self.cost);
+            bc.flag_with_cost(sym, false, cost, use_cost, emit);
+        }
+        self.enc_y_mode(r, c, mode);
+        if (V_PRED..=H_PRED).contains(&mode) {
+            self.enc_angle_delta_zero(mode);
+        }
+        self.record_y_mode(r, c, bw4, bw4, mode);
+        if mode == DC_PRED as u8 {
+            let above_palette = r > 0 && self.psize[(r - 1) * self.mi_cols + c] > 0;
+            let left_palette = c > 0 && self.psize[r * self.mi_cols + c - 1] > 0;
+            let palette_ctx = usize::from(above_palette) + usize::from(left_palette);
+            self.enc_pal_mode(bsl, palette_ctx, 0);
+        }
+
+        if exact_prediction {
+            // With skip=1, the decoder applies these same 4x4 predictions
+            // and reads no TXB/coefficient symbols. Verify the omitted
+            // residual is identically zero, then mirror reset_block_context.
+            self.reset_coeff_context(r, c, bw4, bw4);
+            for yy in 0..bw4 {
+                for xx in 0..bw4 {
+                    let (rr, cc) = (r + yy, c + xx);
+                    self.skip[rr * self.mi_cols + cc] = 1;
+                    self.psize[rr * self.mi_cols + cc] = 0;
+                    self.pcolors[rr * self.mi_cols + cc] = [0; 8];
+                }
+            }
+            if let Some(bc) = self.intrabc.as_mut() {
+                bc.record(r, c, bw4, bw4, None);
+            }
+            return Ok(());
+        }
+
+        // AV1 codes transform blocks in full-block raster order. The cache is
+        // 16x16-pattern based, so each TX looks up its containing template,
+        // but entropy/context updates remain in the normative transform order.
+        for tx_y in 0..bw4 {
+            for tx_x in 0..bw4 {
+                let (x, y) = (sx + tx_x * 4, sy + tx_y * 4);
+                let mi_x = x / 4;
+                let mi_y = y / 4;
+                let cached_template = if self.scaled_8x_profile {
+                    let (tile_x, tile_y) = (x / 16 * 16, y / 16 * 16);
+                    let key = self.scaled_pattern_key(tile_x, tile_y, mode);
+                    let template = self
+                        .scaled_pattern_cache
+                        .entry(key)
+                        .or_insert_with(|| make_residual_pattern_template(key));
+                    let local_tx = ((y - tile_y) / 4) * 4 + (x - tile_x) / 4;
+                    Some((
+                        template.predictor[local_tx],
+                        template.coefficients[local_tx],
+                    ))
+                } else {
+                    None
+                };
+                let predictors = cached_template
+                    .map(|(predictor, _)| predictor)
+                    .unwrap_or_else(|| self.residual_predictor_4x4(x, y, mode));
+                let mut residual_pixels = [0i32; 16];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        residual_pixels[dy * 4 + dx] = i32::from(self.sample(x + dx, y + dy))
+                            - i32::from(predictors[dy * 4 + dx]);
+                    }
+                }
+                let coefficients = if let Some((_, coefficients)) = cached_template {
+                    coefficients
+                } else if let Some(cached) = self.residual_transform_cache.get(&residual_pixels) {
+                    *cached
+                } else {
+                    let transformed = residual::forward_wht4x4(&residual_pixels);
+                    self.residual_transform_cache
+                        .insert(residual_pixels, transformed);
+                    transformed
+                };
+                let inverse = residual::inverse_wht4x4(&coefficients);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let reconstructed =
+                            i32::from(predictors[dy * 4 + dx]) + inverse[dy * 4 + dx];
+                        if reconstructed != i32::from(self.sample(x + dx, y + dy)) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "intra mode {mode} TX_4X4 did not reconstruct source at ({},{})",
+                                    x + dx,
+                                    y + dy
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let txb_ctx = self.txb_skip_ctx_4x4(mi_y, mi_x);
+                let dc_ctx = self.dc_sign_ctx_4x4(mi_y, mi_x);
+                let use_cost = self.count_cost();
+                let cost = use_cost.then_some(&mut self.cost);
+                let sym = (!self.cost_only).then_some(&mut self.sym);
+                let coeff_context = residual::encode_tx4x4_coefficients_with_cost(
+                    sym,
+                    self.coeff_cdfs
+                        .as_mut()
+                        .expect("residual profile initializes coefficient CDFs"),
+                    &coefficients,
+                    txb_ctx,
+                    dc_ctx,
+                    cost,
+                )?;
+                self.record_coeff_context_4x4(mi_y, mi_x, coeff_context);
+            }
+        }
+
+        for yy in 0..bw4 {
+            for xx in 0..bw4 {
+                let (rr, cc) = (r + yy, c + xx);
+                self.skip[rr * self.mi_cols + cc] = 0;
+                self.psize[rr * self.mi_cols + cc] = 0;
+                self.pcolors[rr * self.mi_cols + cc] = [0; 8];
+            }
+        }
+        if let Some(bc) = self.intrabc.as_mut() {
+            bc.record(r, c, bw4, bw4, None);
+        }
+        Ok(())
     }
 
     /// IntraBC copy available for the `bw4`-MI square at MI `(r, c)` right
@@ -1948,10 +3031,11 @@ impl<'a> TileEncoder<'a> {
         }
         let index_slice = &index_map[..area];
 
-        // y_mode = DC_PRED (all neighbours are DC, so contexts are row 0).
-        // (No `ymode` grid: the all-DC invariant is explicit — neighbours
-        // are always DC on both paths, so nothing reads it back.)
-        self.enc_y_dc(DC_PRED);
+        // Palette blocks use DC_PRED. In the residual profile, mode contexts
+        // follow the per-MI mode grid; the legacy path keeps its original
+        // single all-DC CDF row.
+        self.enc_y_mode(r, c, DC_PRED as u8);
+        self.record_y_mode(r, c, bw4, bw4, DC_PRED as u8);
 
         // has_palette_y = 1 (context = neighbours paletted; CDF row
         // selected by block size via `bsl`).
@@ -2048,6 +3132,7 @@ impl<'a> TileEncoder<'a> {
                 self.pcolors[rr * self.mi_cols + cc][..psize].copy_from_slice(colors_slice);
             }
         }
+        self.reset_coeff_context(r, c, n4, n4);
         // Mirror dav1d's `splat_intraref`: palette blocks contribute no
         // motion candidate (and mark the footprint decoded for match
         // search) exactly like the decoder's `rt` grid.
@@ -2362,6 +3447,8 @@ impl<'a> TileEncoder<'a> {
                 self.psize[rr * self.mi_cols + cc] = 0;
             }
         }
+        self.record_y_mode(r, c, n4, n4, DC_PRED as u8);
+        self.reset_coeff_context(r, c, n4, n4);
         self.intrabc
             .as_mut()
             .ok_or_else(|| io::Error::other("internal: missing IntraBC state"))?
@@ -2453,6 +3540,7 @@ impl<'a> TileEncoder<'a> {
         let mut skip_fp = [0; MAX_FOOTPRINT];
         let mut psize_fp = [0; MAX_FOOTPRINT];
         let mut pcolors_fp = [[0; 8]; MAX_FOOTPRINT];
+        let mut ymode_fp = self.ymode.as_ref().map(|_| [DC_PRED as u8; MAX_FOOTPRINT]);
         let mut decoded_fp = [false; MAX_FOOTPRINT];
         let mut rec_fp = [MvRec::default(); MAX_FOOTPRINT];
         let mut footprint_len = 0;
@@ -2467,6 +3555,9 @@ impl<'a> TileEncoder<'a> {
                     skip_fp[footprint_len] = self.skip[idx];
                     psize_fp[footprint_len] = self.psize[idx];
                     pcolors_fp[footprint_len] = self.pcolors[idx];
+                    if let (Some(grid), Some(saved)) = (&self.ymode, ymode_fp.as_mut()) {
+                        saved[footprint_len] = grid[idx];
+                    }
                     if let Some(bc) = self.intrabc.as_ref() {
                         decoded_fp[footprint_len] = bc.decoded[idx];
                         rec_fp[footprint_len] = bc.rec[idx];
@@ -2476,10 +3567,20 @@ impl<'a> TileEncoder<'a> {
             }
         }
         let mut above_fp = [0; 16];
+        let mut residual_coeff_contexts = self.residual_profile.then_some(ResidualCoeffSnapshot {
+            above_level: [0; 16],
+            left_level: [0; 16],
+            above_dc: [0; 16],
+            left_dc: [0; 16],
+        });
         let mut above_len = 0;
         for k in 0..bw4 {
             if c + k < self.mi_cols {
                 above_fp[above_len] = self.above_part[c + k];
+                if let Some(saved) = residual_coeff_contexts.as_mut() {
+                    saved.above_level[above_len] = self.above_coeff_level[c + k];
+                    saved.above_dc[above_len] = self.above_coeff_dc[c + k];
+                }
                 above_len += 1;
             }
         }
@@ -2488,12 +3589,18 @@ impl<'a> TileEncoder<'a> {
         for k in 0..bh4 {
             if r + k < self.mi_rows {
                 left_fp[left_len] = self.left_part[r + k];
+                if let Some(saved) = residual_coeff_contexts.as_mut() {
+                    saved.left_level[left_len] = self.left_coeff_level[r + k];
+                    saved.left_dc[left_len] = self.left_coeff_dc[r + k];
+                }
                 left_len += 1;
             }
         }
         Snapshot {
             sym: save_symbol_state.then(|| self.sym.clone()),
             cdfs: self.cdfs.clone(),
+            coeff_cdfs: self.coeff_cdfs.clone(),
+            residual_mode_cdfs: self.residual_mode_cdfs.clone(),
             intrabc_cdfs: self.intrabc.as_ref().map(|bc| bc.snapshot_cdfs()),
             cost: self.cost,
             cost_only: self.cost_only,
@@ -2505,6 +3612,8 @@ impl<'a> TileEncoder<'a> {
             skip_fp,
             psize_fp,
             pcolors_fp,
+            ymode_fp,
+            residual_coeff_contexts,
             decoded_fp,
             rec_fp,
             above_len,
@@ -2520,6 +3629,8 @@ impl<'a> TileEncoder<'a> {
             self.sym = sym;
         }
         self.cdfs = snap.cdfs;
+        self.coeff_cdfs = snap.coeff_cdfs;
+        self.residual_mode_cdfs = snap.residual_mode_cdfs;
         self.cost = snap.cost;
         self.cost_only = snap.cost_only;
         if let (Some(bc), Some(saved)) = (self.intrabc.as_mut(), snap.intrabc_cdfs) {
@@ -2535,6 +3646,10 @@ impl<'a> TileEncoder<'a> {
                         self.skip[idx] = snap.skip_fp[i];
                         self.psize[idx] = snap.psize_fp[i];
                         self.pcolors[idx] = snap.pcolors_fp[i];
+                        if let (Some(grid), Some(saved)) = (&mut self.ymode, snap.ymode_fp.as_ref())
+                        {
+                            grid[idx] = saved[i];
+                        }
                     }
                     if let Some(bc) = self.intrabc.as_mut() {
                         if i < snap.footprint_len {
@@ -2550,12 +3665,20 @@ impl<'a> TileEncoder<'a> {
             let v = snap.above_fp[k];
             if snap.c + k < self.mi_cols {
                 self.above_part[snap.c + k] = v;
+                if let Some(saved) = &snap.residual_coeff_contexts {
+                    self.above_coeff_level[snap.c + k] = saved.above_level[k];
+                    self.above_coeff_dc[snap.c + k] = saved.above_dc[k];
+                }
             }
         }
         for k in 0..snap.left_len {
             let v = snap.left_fp[k];
             if snap.r + k < self.mi_rows {
                 self.left_part[snap.r + k] = v;
+                if let Some(saved) = &snap.residual_coeff_contexts {
+                    self.left_coeff_level[snap.r + k] = saved.left_level[k];
+                    self.left_coeff_dc[snap.r + k] = saved.left_dc[k];
+                }
             }
         }
     }
@@ -2602,7 +3725,7 @@ impl<'a> TileEncoder<'a> {
     ) -> io::Result<()> {
         debug_assert_eq!(bsl, 2);
         let bw4 = 4usize;
-        if self.intrabc.is_none() {
+        if self.intrabc.is_none() && !self.residual_profile {
             // Palette-only: single legal candidate (leaves always ≤4 for
             // valid inputs, checked at the boundary).
             let ctx = self.partition_ctx(r, c, bsl);
@@ -2631,6 +3754,23 @@ impl<'a> TileEncoder<'a> {
                 enc.update_partition_ctx(r, c, bsl);
                 enc.block_with_force(r, c, bsl, top_has_right, None, true)
             })?)
+        } else {
+            None
+        };
+        let residual_pick = if self.residual_profile {
+            let mut best = None;
+            for mode in RESIDUAL_INTRA_MODES {
+                let cost = self.trial(r, c, bw4, bw4, |enc| {
+                    let ctx = enc.partition_ctx(r, c, bsl);
+                    enc.enc_part(bsl, ctx, PARTITION_NONE);
+                    enc.update_partition_ctx(r, c, bsl);
+                    enc.encode_residual_block(r, c, bsl, mode)
+                })?;
+                if best.is_none_or(|(_, incumbent)| cost < incumbent - 1e-9) {
+                    best = Some((mode, cost));
+                }
+            }
+            best
         } else {
             None
         };
@@ -2727,17 +3867,31 @@ impl<'a> TileEncoder<'a> {
             }
             best
         };
-        // Decide (tie → palette, earliest in order, deterministic).
-        let use_palette = match (pal_cost, best_copy) {
-            (Some(pc), Some(copy)) => copy.cost >= pc - EPS,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => {
-                return Err(invalid_input(format!(
-                    "no legal RDO leaf candidate at MI ({r},{c})"
-                )));
+        // Existing candidates retain their historical tie order (palette,
+        // then copy). Residual modes replace the incumbent only on a strict
+        // local estimated-cost improvement.
+        #[derive(Clone, Copy)]
+        enum LeafPick {
+            Palette,
+            Copy(RankedCopyCost),
+            Residual(u8),
+        }
+        let mut best = match (pal_cost, best_copy) {
+            (Some(pc), Some(copy)) if copy.cost < pc - EPS => {
+                Some((LeafPick::Copy(copy), copy.cost))
             }
+            (Some(pc), _) => Some((LeafPick::Palette, pc)),
+            (None, Some(copy)) => Some((LeafPick::Copy(copy), copy.cost)),
+            (None, None) => None,
         };
+        if let Some((mode, cost)) = residual_pick {
+            if best.is_none_or(|(_, incumbent)| cost < incumbent - EPS) {
+                best = Some((LeafPick::Residual(mode), cost));
+            }
+        }
+        let selected = best
+            .map(|(pick, _)| pick)
+            .ok_or_else(|| invalid_input(format!("no legal RDO leaf candidate at MI ({r},{c})")))?;
         // Committed re-encode at the enclosing depth (speculative when nested,
         // committed when top-level). Preserves the parent trial's state so
         // rejected branches never increment committed-path counters.
@@ -2747,48 +3901,59 @@ impl<'a> TileEncoder<'a> {
             "trials must restore enclosing depth"
         );
         self.restore_speculative(outer_depth);
-        if use_palette {
-            let ctx = self.partition_ctx(r, c, bsl);
-            self.enc_part(bsl, ctx, PARTITION_NONE);
-            self.update_partition_ctx(r, c, bsl);
-            self.block_with_force(r, c, bsl, top_has_right, None, true)?;
-            if let Some(plan) = plan.as_deref_mut() {
-                plan.push(PlanDecision::Palette);
+        match selected {
+            LeafPick::Palette => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                self.block_with_force(r, c, bsl, top_has_right, None, true)?;
+                if let Some(plan) = plan.as_deref_mut() {
+                    plan.push(PlanDecision::Palette);
+                }
             }
-        } else {
-            let selected = best_copy.expect("copy must exist when chosen");
-            let mv_pred = selected.mv_pred;
-            let uniform_copy = selected.uniform;
-            if !self.cost_only
-                && self.motion_candidate_policy == MotionCandidatePolicy::TopK8
-                && !uniform_copy
-                && selected.shortlist_index > 0
-            {
-                use std::sync::atomic::Ordering;
-                MOTION_ALTERNATE_CHOICES.fetch_add(1, Ordering::Relaxed);
-                MOTION_ALTERNATE_INDEX_SUM
-                    .fetch_add(selected.shortlist_index as u64, Ordering::Relaxed);
+            LeafPick::Copy(selected) => {
+                let mv_pred = selected.mv_pred;
+                let uniform_copy = selected.uniform;
+                if !self.cost_only
+                    && self.motion_candidate_policy == MotionCandidatePolicy::TopK8
+                    && !uniform_copy
+                    && selected.shortlist_index > 0
+                {
+                    use std::sync::atomic::Ordering;
+                    MOTION_ALTERNATE_CHOICES.fetch_add(1, Ordering::Relaxed);
+                    MOTION_ALTERNATE_INDEX_SUM
+                        .fetch_add(selected.shortlist_index as u64, Ordering::Relaxed);
+                }
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                let sctx = self.skip_ctx(r, c);
+                self.enc_skip(sctx, 1);
+                self.encode_copy(
+                    r,
+                    c,
+                    bsl,
+                    bw4,
+                    mv_pred.0 .0,
+                    mv_pred.0 .1,
+                    mv_pred.1 .0,
+                    mv_pred.1 .1,
+                )?;
+                if uniform_copy {
+                    self.record_uniform_copy_selected();
+                }
+                if let Some(plan) = plan {
+                    plan.push(PlanDecision::Copy(mv_pred, uniform_copy));
+                }
             }
-            let ctx = self.partition_ctx(r, c, bsl);
-            self.enc_part(bsl, ctx, PARTITION_NONE);
-            self.update_partition_ctx(r, c, bsl);
-            let sctx = self.skip_ctx(r, c);
-            self.enc_skip(sctx, 1);
-            self.encode_copy(
-                r,
-                c,
-                bsl,
-                bw4,
-                mv_pred.0 .0,
-                mv_pred.0 .1,
-                mv_pred.1 .0,
-                mv_pred.1 .1,
-            )?;
-            if uniform_copy {
-                self.record_uniform_copy_selected();
-            }
-            if let Some(plan) = plan {
-                plan.push(PlanDecision::Copy(mv_pred, uniform_copy));
+            LeafPick::Residual(mode) => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                self.encode_residual_block(r, c, bsl, mode)?;
+                if let Some(plan) = plan {
+                    plan.push(PlanDecision::Residual(mode));
+                }
             }
         }
         Ok(())
@@ -2821,7 +3986,7 @@ impl<'a> TileEncoder<'a> {
         // Preserve the enclosing speculative depth (see `rdo_leaf`).
         let outer_depth = self.speculative_depth();
         // Palette-only mode: palette vs split.
-        if self.intrabc.is_none() {
+        if self.intrabc.is_none() && !self.residual_profile {
             let pal_legal = self.palette_legal(r, c, bw4);
             if !pal_legal {
                 // Must split (no trial needed for the single legal option).
@@ -2969,6 +4134,23 @@ impl<'a> TileEncoder<'a> {
                 Some((cost, mv_pred, is_uniform))
             }
         };
+        let residual_pick = if self.residual_profile {
+            let mut best = None;
+            for mode in RESIDUAL_INTRA_MODES {
+                let cost = self.trial(r, c, bw4, bw4, |enc| {
+                    let ctx = enc.partition_ctx(r, c, bsl);
+                    enc.enc_part(bsl, ctx, PARTITION_NONE);
+                    enc.update_partition_ctx(r, c, bsl);
+                    enc.encode_residual_block(r, c, bsl, mode)
+                })?;
+                if best.is_none_or(|(_, incumbent)| cost < incumbent - 1e-9) {
+                    best = Some((mode, cost));
+                }
+            }
+            best
+        } else {
+            None
+        };
         let mut split_plan = PartitionPlan::new();
         let split_cost: Option<f64> = match self.trial(r, c, bw4, bw4, |enc| {
             let ctx = enc.partition_ctx(r, c, bsl);
@@ -3019,6 +4201,7 @@ impl<'a> TileEncoder<'a> {
         enum Pick {
             Palette,
             Copy,
+            Residual(u8),
             Split,
         }
         let mut best = Pick::Split;
@@ -3035,9 +4218,15 @@ impl<'a> TileEncoder<'a> {
                 best_cost = pc;
             }
         }
+        if let Some((mode, rc)) = residual_pick {
+            if rc < best_cost - EPS {
+                best = Pick::Residual(mode);
+                best_cost = rc;
+            }
+        }
         // Edge: no palette and no copy (levels>4, no match) → split only.
         // `best` is already Split in that case.
-        if pal_cost.is_none() && copy_cost.is_none() {
+        if pal_cost.is_none() && copy_cost.is_none() && residual_pick.is_none() {
             best = Pick::Split;
         }
         let _ = best_cost;
@@ -3076,6 +4265,13 @@ impl<'a> TileEncoder<'a> {
                     self.record_uniform_copy_selected();
                 }
                 Self::record_plan(&mut plan, PlanDecision::Copy(mv_pred, uniform_copy));
+            }
+            Pick::Residual(mode) => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                self.encode_residual_block(r, c, bsl, mode)?;
+                Self::record_plan(&mut plan, PlanDecision::Residual(mode));
             }
             Pick::Split => {
                 let ctx = self.partition_ctx(r, c, bsl);
@@ -3168,6 +4364,12 @@ impl<'a> TileEncoder<'a> {
                 if uniform_copy {
                     self.record_uniform_copy_selected();
                 }
+            }
+            PlanDecision::Residual(mode) => {
+                let ctx = self.partition_ctx(r, c, bsl);
+                self.enc_part(bsl, ctx, PARTITION_NONE);
+                self.update_partition_ctx(r, c, bsl);
+                self.encode_residual_block(r, c, bsl, mode)?;
             }
             PlanDecision::Split => {
                 let ctx = self.partition_ctx(r, c, bsl);
@@ -3621,7 +4823,7 @@ fn encode_obu_payload_with_policy(
             gray,
             w,
             h,
-            false,
+            USE_INTRABC,
             flat_pad_policy,
             search_radius_rings,
             uniform_search_radius_rings,
@@ -3761,6 +4963,7 @@ fn encode_obu_payload_with_rdo_and_pad_policy(
 // Clippy's count is a false positive here: this internal bridge carries the
 // same encoder controls as its existing RDO entry point plus one policy.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn encode_obu_payload_with_rdo_pad_and_motion_policy(
     gray: &[u8],
     w: u32,
@@ -3771,8 +4974,37 @@ fn encode_obu_payload_with_rdo_pad_and_motion_policy(
     uniform_search_radius_rings: i32,
     motion_candidate_policy: MotionCandidatePolicy,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_with_rdo_pad_motion_residual(
+        gray,
+        w,
+        h,
+        use_intrabc,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+        motion_candidate_policy,
+        false,
+        false,
+    )
+}
+
+// Clippy's count is a false positive for this internal adapter: it preserves
+// the existing encoder controls and adds the two residual-profile selectors.
+#[allow(clippy::too_many_arguments)]
+fn encode_obu_payload_with_rdo_pad_motion_residual(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    use_intrabc: bool,
+    flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+    motion_candidate_policy: MotionCandidatePolicy,
+    residual_profile: bool,
+    scaled_8x_profile: bool,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     let (_, masks) = validate_gray(gray, w, h)?;
-    let tile = TileEncoder::new_with_rdo_pad_and_motion_policy(
+    let mut tile = TileEncoder::new_with_rdo_pad_and_motion_policy(
         gray,
         w as usize,
         h as usize,
@@ -3784,6 +5016,9 @@ fn encode_obu_payload_with_rdo_pad_and_motion_policy(
         uniform_search_radius_rings,
         motion_candidate_policy,
     )?;
+    if residual_profile {
+        tile.enable_residual_profile(scaled_8x_profile);
+    }
     let tile_data = tile.finish()?;
     let seq_obu = obu_wrap(1, &sequence_header_obu(w, h));
     let mut frame_payload = frame_header_bits(w, h, use_intrabc)?;
@@ -3844,8 +5079,35 @@ fn encode_obu_payload_rdo_with_policy_and_motion(
     uniform_search_radius_rings: i32,
     motion_candidate_policy: MotionCandidatePolicy,
 ) -> io::Result<(Vec<u8>, [u8; 4])> {
+    encode_obu_payload_rdo_with_policy_motion_residual(
+        gray,
+        w,
+        h,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+        motion_candidate_policy,
+        false,
+        false,
+    )
+}
+
+// Clippy's count is a false positive for this internal adapter: it forwards
+// the existing RDO controls plus the two residual-profile selectors.
+#[allow(clippy::too_many_arguments)]
+fn encode_obu_payload_rdo_with_policy_motion_residual(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+    motion_candidate_policy: MotionCandidatePolicy,
+    residual_profile: bool,
+    scaled_8x_profile: bool,
+) -> io::Result<(Vec<u8>, [u8; 4])> {
     if !USE_INTRABC {
-        return encode_obu_payload_with_rdo_pad_and_motion_policy(
+        return encode_obu_payload_with_rdo_pad_motion_residual(
             gray,
             w,
             h,
@@ -3854,9 +5116,11 @@ fn encode_obu_payload_rdo_with_policy_and_motion(
             search_radius_rings,
             uniform_search_radius_rings,
             motion_candidate_policy,
+            residual_profile,
+            scaled_8x_profile,
         );
     }
-    encode_obu_payload_with_rdo_pad_and_motion_policy(
+    encode_obu_payload_with_rdo_pad_motion_residual(
         gray,
         w,
         h,
@@ -3865,6 +5129,8 @@ fn encode_obu_payload_rdo_with_policy_and_motion(
         search_radius_rings,
         uniform_search_radius_rings,
         motion_candidate_policy,
+        residual_profile,
+        scaled_8x_profile,
     )
 }
 
@@ -4095,6 +5361,41 @@ pub fn encode_gray_pair_with_pad_policy_and_motion_candidate(
     uniform_search_radius_rings: i32,
     motion_candidate_policy: MotionCandidatePolicy,
 ) -> io::Result<Vec<u8>> {
+    encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+        small,
+        sw,
+        sh,
+        large,
+        lw,
+        lh,
+        flat_pad_policy,
+        search_radius_rings,
+        uniform_search_radius_rings,
+        motion_candidate_policy,
+        false,
+    )
+}
+
+/// Pair encoder with opt-in coded-lossless residual candidates.
+/// Residual candidates are considered only when the source uses the exact
+/// four-shade alphabet and `large` is a byte-exact 8x nearest-neighbor image
+/// of `small`; otherwise this falls back to the established candidate set.
+// Clippy's count is a false positive here: this public convenience API keeps
+// the established per-image dimensions and encoder policy arguments explicit.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+    small: &[u8],
+    sw: u32,
+    sh: u32,
+    large: &[u8],
+    lw: u32,
+    lh: u32,
+    flat_pad_policy: FlatPadPolicy,
+    search_radius_rings: i32,
+    uniform_search_radius_rings: i32,
+    motion_candidate_policy: MotionCandidatePolicy,
+    residual_transform: bool,
+) -> io::Result<Vec<u8>> {
     let base_small = encode_obu_payload_with_policy(
         small,
         sw,
@@ -4146,13 +5447,70 @@ pub fn encode_gray_pair_with_pad_policy_and_motion_candidate(
         }
     };
 
-    let small_candidates = [Some(base_small), rdo_small];
-    let large_candidates = [Some(base_large), rdo_large];
+    let residual_profile =
+        residual_transform && verify_residual_pair(small, sw, sh, large, lw, lh)?;
+    let residual_small = if residual_profile {
+        match encode_obu_payload_rdo_with_policy_motion_residual(
+            small,
+            sw,
+            sh,
+            flat_pad_policy,
+            search_radius_rings,
+            uniform_search_radius_rings,
+            MotionCandidatePolicy::FirstMatch,
+            true,
+            false,
+        ) {
+            Ok(candidate) => Some(candidate),
+            Err(_) => {
+                had_rdo_error = true;
+                RDO_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let residual_large = if residual_profile {
+        match encode_obu_payload_rdo_with_policy_motion_residual(
+            large,
+            lw,
+            lh,
+            flat_pad_policy,
+            search_radius_rings,
+            uniform_search_radius_rings,
+            motion_candidate_policy,
+            true,
+            true,
+        ) {
+            Ok(candidate) => Some(candidate),
+            Err(_) => {
+                had_rdo_error = true;
+                RDO_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let small_candidates = [Some(base_small), rdo_small, residual_small];
+    let large_candidates = [Some(base_large), rdo_large, residual_large];
     // Stable order keeps baseline/baseline on ties, then tests mixed small,
     // mixed large, and finally RDO/RDO. Each serialization contains the
     // complete item metadata and altr group and therefore compares exactly
     // what will be written.
-    let mode_order = [(0usize, 0usize), (1, 0), (0, 1), (1, 1)];
+    let mode_order = [
+        (0usize, 0usize),
+        (1, 0),
+        (0, 1),
+        (1, 1),
+        (2, 0),
+        (0, 2),
+        (2, 1),
+        (1, 2),
+        (2, 2),
+    ];
     let mut best_bytes: Option<Vec<u8>> = None;
     let mut best_mode = (0usize, 0usize);
     for mode in mode_order {
@@ -4185,7 +5543,7 @@ pub fn encode_gray_pair_with_pad_policy_and_motion_candidate(
         };
         if best_bytes
             .as_ref()
-            .is_none_or(|best| bytes.len() < best.len())
+            .is_none_or(|best| complete_avif_candidate_is_strictly_smaller(&bytes, best))
         {
             best_bytes = Some(bytes);
             best_mode = mode;
@@ -4199,6 +5557,45 @@ pub fn encode_gray_pair_with_pad_policy_and_motion_candidate(
         BASELINE_WINS.fetch_add(1, Ordering::Relaxed);
     }
     best_bytes.ok_or_else(|| io::Error::other("no encoded pair candidates"))
+}
+
+fn verify_residual_pair(
+    small: &[u8],
+    sw: u32,
+    sh: u32,
+    large: &[u8],
+    lw: u32,
+    lh: u32,
+) -> io::Result<bool> {
+    let small_area = checked_area(sw, sh)?;
+    let large_area = checked_area(lw, lh)?;
+    if small.len() != small_area || large.len() != large_area {
+        return Err(invalid_input(format!(
+            "pixel buffers do not match dimensions: small {} for {sw}x{sh}, large {} for {lw}x{lh}",
+            small.len(),
+            large.len()
+        )));
+    }
+    if sw.checked_mul(8) != Some(lw) || sh.checked_mul(8) != Some(lh) {
+        return Ok(false);
+    }
+    if small
+        .iter()
+        .any(|&pixel| GRAY_TO_SHADE[pixel as usize] == 0xFF)
+    {
+        return Ok(false);
+    }
+    let (sw, lw) = (sw as usize, lw as usize);
+    for y in 0..lh as usize {
+        let small_row = (y / 8) * sw;
+        let large_row = y * lw;
+        for x in 0..lw {
+            if large[large_row + x] != small[small_row + x / 8] {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 struct PairPayload<'a> {
@@ -4239,6 +5636,10 @@ fn mux_gray_pair_payloads(small: PairPayload<'_>, large: PairPayload<'_>) -> io:
     write_isobmff(&image).map_err(|e| io::Error::other(format!("avif mux: {e:?}")))
 }
 
+fn complete_avif_candidate_is_strictly_smaller(candidate: &[u8], incumbent: &[u8]) -> bool {
+    candidate.len() < incumbent.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4249,6 +5650,115 @@ mod tests {
         (0..h)
             .flat_map(|y| (0..w).map(move |x| if ((x / 8) + (y / 8)) % 2 == 0 { 0 } else { 255 }))
             .collect()
+    }
+
+    fn forced_residual_payload(
+        gray: &[u8],
+        w: u32,
+        h: u32,
+        scaled_8x_profile: bool,
+        mode: u8,
+    ) -> (Vec<u8>, [u8; 4]) {
+        let (_, masks) = validate_gray(gray, w, h).unwrap();
+        let mut tile = TileEncoder::new_with_rdo_pad_and_motion_policy(
+            gray,
+            w as usize,
+            h as usize,
+            USE_INTRABC,
+            masks,
+            true,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+        )
+        .unwrap();
+        tile.enable_residual_profile(scaled_8x_profile);
+        for r in (0..tile.mi_rows).step_by(16) {
+            for c in (0..tile.mi_cols).step_by(16) {
+                let bsl = 4;
+                let ctx = tile.partition_ctx(r, c, bsl);
+                tile.enc_part(bsl, ctx, PARTITION_NONE);
+                tile.update_partition_ctx(r, c, bsl);
+                tile.encode_residual_block(r, c, bsl, mode).unwrap();
+            }
+        }
+        let tile_data = tile.sym.finish();
+        let mut frame_payload = frame_header_bits(w, h, USE_INTRABC).unwrap();
+        frame_payload.extend_from_slice(&tile_data);
+        let mut payload = obu_wrap(1, &sequence_header_obu(w, h));
+        payload.extend_from_slice(&obu_wrap(6, &frame_payload));
+        (payload, av1c_mono8(seq_level_idx_for(w, h)))
+    }
+
+    fn assert_obu_exact_with_independent_decoders(
+        payload: &[u8],
+        expected: &[u8],
+        width: usize,
+        height: usize,
+        label: &str,
+    ) {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "residual_transform_decode_{}_{}",
+            std::process::id(),
+            label
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("item.ivf");
+        let mut ivf = Vec::with_capacity(32 + 12 + payload.len());
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes());
+        ivf.extend_from_slice(&32u16.to_le_bytes());
+        ivf.extend_from_slice(b"AV01");
+        ivf.extend_from_slice(&(width as u16).to_le_bytes());
+        ivf.extend_from_slice(&(height as u16).to_le_bytes());
+        ivf.extend_from_slice(&30u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes());
+        ivf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u64.to_le_bytes());
+        ivf.extend_from_slice(payload);
+        std::fs::write(&input, ivf).unwrap();
+        let mut ran_decoder = false;
+        for decoder in ["aomdec", "dav1d"] {
+            if Command::new(decoder).arg("--version").output().is_err() {
+                eprintln!("{decoder} unavailable; skipping this decoder");
+                continue;
+            }
+            ran_decoder = true;
+            let output = dir.join(format!("{decoder}.yuv"));
+            let status = if decoder == "aomdec" {
+                Command::new(decoder)
+                    .args(["--codec=av1", "--rawvideo", "--output-bit-depth=8", "-o"])
+                    .arg(&output)
+                    .arg(&input)
+                    .status()
+                    .unwrap()
+            } else {
+                Command::new(decoder)
+                    .args(["--demuxer", "ivf", "-i"])
+                    .arg(&input)
+                    .args(["-o"])
+                    .arg(&output)
+                    .args(["--muxer", "yuv", "--quiet"])
+                    .status()
+                    .unwrap()
+            };
+            assert!(status.success(), "{decoder} rejected {label} AV1 item");
+            let decoded = std::fs::read(&output).unwrap();
+            let luma_end = width * height;
+            assert!(decoded.len() >= luma_end, "{decoder} output is truncated");
+            assert_eq!(
+                &decoded[..luma_end],
+                expected,
+                "{decoder} changed {label} luma samples"
+            );
+        }
+        assert!(ran_decoder, "no independent AV1 decoder is installed");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -4262,6 +5772,150 @@ mod tests {
         assert!(img.items.iter().all(|it| it.item_type == *b"av01"));
         assert_eq!(img.groups.len(), 1);
         assert_eq!(img.groups[0].group_type, *b"altr");
+    }
+
+    #[test]
+    fn complete_avif_size_ties_keep_the_earlier_candidate() {
+        let make_pair = |small_payload: &[u8], large_payload: &[u8]| {
+            mux_gray_pair_payloads(
+                PairPayload {
+                    payload: small_payload,
+                    av1c: av1c_mono8(0),
+                    width: 16,
+                    height: 16,
+                },
+                PairPayload {
+                    payload: large_payload,
+                    av1c: av1c_mono8(0),
+                    width: 128,
+                    height: 128,
+                },
+            )
+            .unwrap()
+        };
+        let earlier = make_pair(&[0x01, 0x02], &[0x03, 0x04]);
+        let tied_later = make_pair(&[0x05, 0x06], &[0x07, 0x08]);
+        assert_eq!(earlier.len(), tied_later.len());
+        assert!(!complete_avif_candidate_is_strictly_smaller(
+            &tied_later,
+            &earlier
+        ));
+    }
+
+    #[test]
+    fn residual_profile_verification_enforces_shades_and_exact_eight_x_edges() {
+        let small = (0..16usize * 16)
+            .map(|i| GAME_SHADES[(i / 16 + i % 16) % 4])
+            .collect::<Vec<_>>();
+        let source = &small;
+        let large = (0..128usize)
+            .flat_map(|y| (0..128usize).map(move |x| source[(y / 8) * 16 + x / 8]))
+            .collect::<Vec<_>>();
+        assert!(verify_residual_pair(&small, 16, 16, &large, 128, 128).unwrap());
+
+        let mut unsupported_shade = small.clone();
+        unsupported_shade[0] = 1;
+        let unsupported_source = &unsupported_shade;
+        let unsupported_large = (0..128usize)
+            .flat_map(|y| (0..128usize).map(move |x| unsupported_source[(y / 8) * 16 + x / 8]))
+            .collect::<Vec<_>>();
+        assert!(
+            !verify_residual_pair(&unsupported_shade, 16, 16, &unsupported_large, 128, 128)
+                .unwrap()
+        );
+
+        let mut corrupted_large = large.clone();
+        corrupted_large[0] ^= 1;
+        assert!(!verify_residual_pair(&small, 16, 16, &corrupted_large, 128, 128).unwrap());
+        assert!(!verify_residual_pair(&small, 16, 16, &large[..127 * 128], 128, 127).unwrap());
+        assert_eq!(
+            verify_residual_pair(&small, 16, 16, &large[..large.len() - 1], 128, 128)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn residual_flag_falls_back_and_selects_only_complete_file_wins() {
+        let small = vec![1u8; 16 * 16];
+        let large = vec![1u8; 128 * 128];
+        let args = (
+            16,
+            16,
+            128,
+            128,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+        );
+        let fallback = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &small, args.0, args.1, &large, args.2, args.3, args.4, args.5, args.6, args.7, false,
+        )
+        .unwrap();
+        let unsupported_opt_in =
+            encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+                &small, args.0, args.1, &large, args.2, args.3, args.4, args.5, args.6, args.7,
+                true,
+            )
+            .unwrap();
+        assert_eq!(unsupported_opt_in, fallback);
+
+        let solid_small = vec![85u8; 16 * 16];
+        let solid_large = vec![85u8; 128 * 128];
+        let baseline = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &solid_small,
+            16,
+            16,
+            &solid_large,
+            128,
+            128,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            false,
+        )
+        .unwrap();
+        let selected = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &solid_small,
+            16,
+            16,
+            &solid_large,
+            128,
+            128,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            true,
+        )
+        .unwrap();
+        assert!(selected.len() <= baseline.len());
+        let baseline_image = read_isobmff(&baseline).unwrap();
+        let selected_image = read_isobmff(&selected).unwrap();
+        let baseline_items = baseline_image
+            .items
+            .iter()
+            .map(|item| item.payload.len())
+            .collect::<Vec<_>>();
+        let selected_items = selected_image
+            .items
+            .iter()
+            .map(|item| item.payload.len())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "residual solid 16x16/128x128 fixture: complete AVIF {} -> {} bytes; item payloads {:?} -> {:?}",
+            baseline.len(),
+            selected.len(),
+            baseline_items,
+            selected_items
+        );
+        assert!(
+            selected.len() < baseline.len(),
+            "fixture should show a complete-container residual win"
+        );
     }
 
     #[test]
@@ -4357,6 +6011,368 @@ mod tests {
         assert_eq!(selected, candidates[expected_index]);
         assert!(selected.len() <= candidates[0].len());
         assert!(selected.len() <= candidates[3].len());
+    }
+
+    #[test]
+    fn residual_transform_pair_is_exact_and_never_larger() {
+        let (sw, sh) = (64u32, 64u32);
+        let (lw, lh) = (512u32, 512u32);
+        let mut small = vec![0u8; sw as usize * sh as usize];
+        for y in 0..sh as usize {
+            for x in 0..sw as usize {
+                let shade = ((x / 8) * 3 + (y / 8) * 5 + (x / 16) * (y / 16)) % 4;
+                small[y * sw as usize + x] = GAME_SHADES[shade];
+            }
+        }
+        let source = &small;
+        let large = (0..lh as usize)
+            .flat_map(|y| (0..lw as usize).map(move |x| source[(y / 8) * sw as usize + x / 8]))
+            .collect::<Vec<_>>();
+        assert!(verify_residual_pair(&small, sw, sh, &large, lw, lh).unwrap());
+
+        // Force every contained 64x64 node through the new qindex-0 residual
+        // writer, then decode both AVIF items with libaom and dav1d.
+        let (small_payload, small_av1c) =
+            forced_residual_payload(&small, sw, sh, false, DC_PRED as u8);
+        let (large_payload, large_av1c) =
+            forced_residual_payload(&large, lw, lh, true, DC_PRED as u8);
+        let forced_pair = mux_gray_pair_payloads(
+            PairPayload {
+                payload: &small_payload,
+                av1c: small_av1c,
+                width: sw,
+                height: sh,
+            },
+            PairPayload {
+                payload: &large_payload,
+                av1c: large_av1c,
+                width: lw,
+                height: lh,
+            },
+        )
+        .unwrap();
+        let forced_image = read_isobmff(&forced_pair).unwrap();
+        assert_eq!(forced_image.items.len(), 2);
+        assert_obu_exact_with_independent_decoders(
+            &forced_image.items[1].payload,
+            &small,
+            sw as usize,
+            sh as usize,
+            "forced-small",
+        );
+        assert_obu_exact_with_independent_decoders(
+            &forced_image.items[0].payload,
+            &large,
+            lw as usize,
+            lh as usize,
+            "forced-large",
+        );
+
+        let baseline = encode_gray_pair_with_pad_policy_and_motion_candidate(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+        )
+        .unwrap();
+        let opted_in = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            true,
+        )
+        .unwrap();
+        assert!(opted_in.len() <= baseline.len());
+        let selected_image = read_isobmff(&opted_in).unwrap();
+        assert_eq!(selected_image.items.len(), 2);
+        assert_obu_exact_with_independent_decoders(
+            &selected_image.items[0].payload,
+            &large,
+            lw as usize,
+            lh as usize,
+            "selected-large",
+        );
+        assert_obu_exact_with_independent_decoders(
+            &selected_image.items[1].payload,
+            &small,
+            sw as usize,
+            sh as usize,
+            "selected-small",
+        );
+    }
+
+    #[test]
+    fn qindex_zero_exact_dc_skip_decodes_with_both_independent_decoders() {
+        let (w, h) = (128u32, 128u32);
+        let gray = vec![85u8; w as usize * h as usize];
+        let (_, masks) = validate_gray(&gray, w, h).unwrap();
+        let mut tile = TileEncoder::new_with_rdo_pad_and_motion_policy(
+            &gray,
+            w as usize,
+            h as usize,
+            USE_INTRABC,
+            masks,
+            true,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+        )
+        .unwrap();
+        tile.enable_residual_profile(false);
+        assert!(!tile.residual_block_is_exact_prediction(0, 0, 16, DC_PRED as u8));
+        assert!(tile.residual_block_is_exact_prediction(0, 16, 16, DC_PRED as u8));
+
+        let (payload, _) = forced_residual_payload(&gray, w, h, false, DC_PRED as u8);
+        assert_obu_exact_with_independent_decoders(
+            &payload,
+            &gray,
+            w as usize,
+            h as usize,
+            "q0-dc-skip",
+        );
+    }
+
+    #[test]
+    fn all_supported_residual_modes_decode_exactly_with_two_decoders() {
+        let (width, height) = (128usize, 128usize);
+        let small = (0..16usize * 16)
+            .map(|index| GAME_SHADES[(index * 13 + index / 7) & 3])
+            .collect::<Vec<_>>();
+        let mut scaled = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                scaled[y * width + x] = small[(y / 8) * 16 + x / 8];
+            }
+        }
+        let native = (0..width * height)
+            .map(|index| GAME_SHADES[(index * 5 + index / 11 + index / width) & 3])
+            .collect::<Vec<_>>();
+        for mode in RESIDUAL_INTRA_MODES {
+            let (payload, _) =
+                forced_residual_payload(&scaled, width as u32, height as u32, true, mode);
+            assert_obu_exact_with_independent_decoders(
+                &payload,
+                &scaled,
+                width,
+                height,
+                &format!("scaled-mode-{mode}"),
+            );
+            let (payload, _) =
+                forced_residual_payload(&native, width as u32, height as u32, false, mode);
+            assert_obu_exact_with_independent_decoders(
+                &payload,
+                &native,
+                width,
+                height,
+                &format!("native-mode-{mode}"),
+            );
+        }
+    }
+
+    #[test]
+    fn residual_mode_trials_replay_identical_state_and_rollback() {
+        let width = 128usize;
+        let gray = (0..width * width)
+            .map(|index| GAME_SHADES[(index * 7 + index / 9) & 3])
+            .collect::<Vec<_>>();
+        let (_, masks) = validate_gray(&gray, width as u32, width as u32).unwrap();
+        let mut tile = TileEncoder::new_with_rdo(&gray, width, width, true, masks, true).unwrap();
+        tile.enable_residual_profile(false);
+
+        let base_cdfs = tile.cdfs.clone();
+        let base_coeff_cdfs = tile.coeff_cdfs.clone();
+        let base_mode_cdfs = tile.residual_mode_cdfs.clone();
+        let base_ymode = tile.ymode.clone();
+        let base_above_coeff_level = tile.above_coeff_level.clone();
+        let base_left_coeff_level = tile.left_coeff_level.clone();
+        let base_above_coeff_dc = tile.above_coeff_dc.clone();
+        let base_left_coeff_dc = tile.left_coeff_dc.clone();
+        let base_skip = tile.skip.clone();
+        let base_cost = tile.cost;
+
+        let mut first_costs = Vec::new();
+        for mode in RESIDUAL_INTRA_MODES {
+            let cost = tile
+                .trial(0, 0, 16, 16, |enc| enc.encode_residual_block(0, 0, 4, mode))
+                .unwrap();
+            first_costs.push((mode, cost));
+            assert_eq!(tile.cdfs, base_cdfs);
+            assert_eq!(tile.coeff_cdfs, base_coeff_cdfs);
+            assert_eq!(tile.residual_mode_cdfs, base_mode_cdfs);
+            assert_eq!(tile.ymode, base_ymode);
+            assert_eq!(tile.above_coeff_level, base_above_coeff_level);
+            assert_eq!(tile.left_coeff_level, base_left_coeff_level);
+            assert_eq!(tile.above_coeff_dc, base_above_coeff_dc);
+            assert_eq!(tile.left_coeff_dc, base_left_coeff_dc);
+            assert_eq!(tile.skip, base_skip);
+            assert_eq!(tile.cost, base_cost);
+        }
+        let second_costs = RESIDUAL_INTRA_MODES
+            .map(|mode| {
+                (
+                    mode,
+                    tile.trial(0, 0, 16, 16, |enc| enc.encode_residual_block(0, 0, 4, mode))
+                        .unwrap(),
+                )
+            })
+            .to_vec();
+        assert_eq!(first_costs, second_costs);
+    }
+
+    #[test]
+    fn residual_transform_real_raster_reports_complete_pair_size_and_time() {
+        use std::time::Instant;
+
+        let (sw, sh) = (160u32, 144u32);
+        let (lw, lh) = (1280u32, 1152u32);
+        let small = vec![85u8; sw as usize * sh as usize];
+        let source = &small;
+        let large = (0..lh as usize)
+            .flat_map(|y| (0..lw as usize).map(move |x| source[(y / 8) * sw as usize + x / 8]))
+            .collect::<Vec<_>>();
+        assert!(verify_residual_pair(&small, sw, sh, &large, lw, lh).unwrap());
+
+        let start = Instant::now();
+        let baseline = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            false,
+        )
+        .unwrap();
+        let baseline_time = start.elapsed();
+        let start = Instant::now();
+        let selected = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            true,
+        )
+        .unwrap();
+        let selected_time = start.elapsed();
+        let baseline_image = read_isobmff(&baseline).unwrap();
+        let selected_image = read_isobmff(&selected).unwrap();
+        let item_sizes = |image: &IsoBmffImage| {
+            image
+                .items
+                .iter()
+                .map(|item| item.payload.len())
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "residual real-raster solid 160x144/1280x1152: baseline {} bytes in {:?}, enabled-selected {} bytes in {:?}; item payloads {:?} -> {:?}",
+            baseline.len(),
+            baseline_time,
+            selected.len(),
+            selected_time,
+            item_sizes(&baseline_image),
+            item_sizes(&selected_image)
+        );
+        assert!(selected.len() <= baseline.len());
+    }
+
+    #[test]
+    fn residual_transform_real_raster_covers_every_scaled_pattern() {
+        use std::time::Instant;
+
+        let (sw, sh) = (160u32, 144u32);
+        let (lw, lh) = (1280u32, 1152u32);
+        let mut small = vec![0u8; sw as usize * sh as usize];
+        for block_y in 0..sh as usize / 2 {
+            for block_x in 0..sw as usize / 2 {
+                let pattern = ((block_y * (sw as usize / 2) + block_x) % 256) as u8;
+                for (bit, (dy, dx)) in [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().enumerate() {
+                    let shade = (pattern >> (bit * 2)) & 3;
+                    small[(block_y * 2 + dy) * sw as usize + block_x * 2 + dx] =
+                        GAME_SHADES[shade as usize];
+                }
+            }
+        }
+        let source = &small;
+        let large = (0..lh as usize)
+            .flat_map(|y| (0..lw as usize).map(move |x| source[(y / 8) * sw as usize + x / 8]))
+            .collect::<Vec<_>>();
+        assert!(verify_residual_pair(&small, sw, sh, &large, lw, lh).unwrap());
+
+        let start = Instant::now();
+        let baseline = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            false,
+        )
+        .unwrap();
+        let baseline_time = start.elapsed();
+        let start = Instant::now();
+        let selected = encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
+            &small,
+            sw,
+            sh,
+            &large,
+            lw,
+            lh,
+            FlatPadPolicy::Baseline,
+            intrabc::DEFAULT_SEARCH_RINGS,
+            DEFAULT_UNIFORM_SEARCH_RADIUS_RINGS,
+            MotionCandidatePolicy::FirstMatch,
+            true,
+        )
+        .unwrap();
+        let selected_time = start.elapsed();
+        let baseline_image = read_isobmff(&baseline).unwrap();
+        let selected_image = read_isobmff(&selected).unwrap();
+        let item_sizes = |image: &IsoBmffImage| {
+            image
+                .items
+                .iter()
+                .map(|item| item.payload.len())
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "residual real-raster all-pattern 160x144/1280x1152: baseline {} bytes in {:?}, enabled-selected {} bytes in {:?}; item payloads {:?} -> {:?}",
+            baseline.len(),
+            baseline_time,
+            selected.len(),
+            selected_time,
+            item_sizes(&baseline_image),
+            item_sizes(&selected_image)
+        );
+        assert!(selected.len() <= baseline.len());
     }
 
     #[test]

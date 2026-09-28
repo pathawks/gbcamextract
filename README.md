@@ -7,7 +7,7 @@ Extracts photos from Game Boy Camera / Pocket Camera saves. Frames can be preser
 
 ```console
 gbcamextract [-r rom.gb] [--flat-pad-policy baseline|lookahead] \
-  [--motion-candidate first-match|top-k8] -s save.sav
+  [--motion-candidate first-match|top-k8] [--residual-transform] -s save.sav
 ```
 
 This will produce 30 AVIF files containing your photos. It is optional to specify the rom; this will allow the picture frames to be extracted too.
@@ -58,6 +58,18 @@ to keep the horizon bounded. This is a one-step fractional-bit estimate, not
 a global size optimum. The existing pad is the deterministic tie-break. Use
 `GBCAMEXTRACT_RDO_STATS=1` to include committed flat-block counts, look-ahead
 search counts, and estimated-cost outcomes.
+
+`--residual-transform` enables opt-in qindex-0 4x4 WHT residual candidates,
+using DC, vertical, horizontal, and Paeth luma prediction. It is off by default
+and activates only when the native raster uses exactly the four Game Boy
+shades and the large raster is verified as an exact 8x nearest-neighbor
+upscale. The scaled path caches transform templates for all 256 possible 2x2
+source-shade patterns, keyed by prediction mode and the complete reference-edge
+context, while pricing every block from its live entropy state. Each trial is
+lossless-checked; the encoder selects residual candidates only when complete
+paired AVIF bytes are strictly smaller. The searched prediction family is
+limited to these four modes; this is not a global optimum over every AV1 mode
+or partition tree.
 
 ## Building
 

@@ -91,6 +91,11 @@ struct Args {
     /// RDO policy for exact motion-copy matches on the large raster.
     #[arg(long, value_enum, default_value = "first-match")]
     motion_candidate: MotionCandidateArg,
+    /// Try coded-lossless DC, vertical, horizontal, and Paeth residual candidates.
+    /// The path activates only for verified 2-bit / exact 8x image pairs.
+    /// Unsupported pairs keep using the established palette and IntraBC encoders.
+    #[arg(long, default_value_t = false)]
+    residual_transform: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -305,6 +310,7 @@ struct EncodeIdentity {
     gray_levels: [u8; 4],
     intrabc: bool,
     rdo: bool,
+    residual_transform: bool,
     flat_pad_policy: mono::FlatPadPolicy,
     motion_candidate_policy: mono::MotionCandidatePolicy,
     brands: [[u8; 4]; 3],
@@ -326,9 +332,18 @@ impl EncodeIdentity {
         Self::for_encoder_policies(flat_pad_policy, mono::MotionCandidatePolicy::FirstMatch)
     }
 
+    #[cfg(test)]
     fn for_encoder_policies(
         flat_pad_policy: mono::FlatPadPolicy,
         motion_candidate_policy: mono::MotionCandidatePolicy,
+    ) -> Self {
+        Self::for_encoder_policies_with_residual(flat_pad_policy, motion_candidate_policy, false)
+    }
+
+    fn for_encoder_policies_with_residual(
+        flat_pad_policy: mono::FlatPadPolicy,
+        motion_candidate_policy: mono::MotionCandidatePolicy,
+        residual_transform: bool,
     ) -> Self {
         Self {
             small_w: WIDTH,
@@ -339,6 +354,7 @@ impl EncodeIdentity {
             gray_levels: GRAY_8BIT,
             intrabc: mono::USE_INTRABC,
             rdo: true,
+            residual_transform,
             flat_pad_policy,
             motion_candidate_policy,
             brands: [*b"avif", *b"mif1", *b"miaf"],
@@ -394,12 +410,17 @@ where
     groups
 }
 
-fn group_rendered_with_encoder_policies(
+fn group_rendered_with_encoder_policies_and_residual(
     rasters: Vec<(usize, Vec<u8>)>,
     flat_pad_policy: mono::FlatPadPolicy,
     motion_candidate_policy: mono::MotionCandidatePolicy,
+    residual_transform: bool,
 ) -> Vec<RasterGroup> {
-    let identity = EncodeIdentity::for_encoder_policies(flat_pad_policy, motion_candidate_policy);
+    let identity = EncodeIdentity::for_encoder_policies_with_residual(
+        flat_pad_policy,
+        motion_candidate_policy,
+        residual_transform,
+    );
     group_rendered_by(
         rasters
             .into_iter()
@@ -547,8 +568,12 @@ fn run(args: Args) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     rendered.sort_unstable_by_key(|(slot_num, _)| *slot_num);
-    let groups =
-        group_rendered_with_encoder_policies(rendered, flat_pad_policy, motion_candidate_policy);
+    let groups = group_rendered_with_encoder_policies_and_residual(
+        rendered,
+        flat_pad_policy,
+        motion_candidate_policy,
+        args.residual_transform,
+    );
     eprintln!(
         "gbcamextract: {} unique rendered rasters for 30 slots ({} duplicate slots reused)",
         groups.len(),
@@ -577,7 +602,7 @@ fn run(args: Args) -> Result<(), String> {
             )
         });
         let encode_started = report_rdo_stats.then(std::time::Instant::now);
-        let avif = mono::encode_gray_pair_with_pad_policy_and_motion_candidate(
+        let avif = mono::encode_gray_pair_with_pad_policy_motion_candidate_and_residual_transform(
             &group.gray,
             WIDTH,
             HEIGHT,
@@ -588,6 +613,7 @@ fn run(args: Args) -> Result<(), String> {
             args.intrabc_search_radius,
             args.intrabc_uniform_search_radius,
             motion_candidate_policy,
+            args.residual_transform,
         )
         .map_err(|e| {
                 format!(
@@ -663,7 +689,11 @@ fn run(args: Args) -> Result<(), String> {
         }
         debug_assert_eq!(
             group.identity,
-            EncodeIdentity::for_encoder_policies(flat_pad_policy, motion_candidate_policy)
+            EncodeIdentity::for_encoder_policies_with_residual(
+                flat_pad_policy,
+                motion_candidate_policy,
+                args.residual_transform,
+            )
         );
         for slot_num in group.slots {
             let filename = &filenames[slot_num - 1];
@@ -737,7 +767,13 @@ mod tests {
             mono::FlatPadPolicy::Baseline,
             mono::MotionCandidatePolicy::TopK8,
         );
+        let residual_identity = EncodeIdentity::for_encoder_policies_with_residual(
+            mono::FlatPadPolicy::Baseline,
+            mono::MotionCandidatePolicy::FirstMatch,
+            true,
+        );
         assert_ne!(identity, motion_identity);
+        assert_ne!(identity, residual_identity);
         let groups = group_rendered_by(
             vec![
                 (1, identity, vec![0, 85, 170, 255]),
@@ -745,13 +781,15 @@ mod tests {
                 (3, identity, vec![0, 85, 170, 254]),
                 (4, other_identity, vec![0, 85, 170, 255]),
                 (5, motion_identity, vec![0, 85, 170, 255]),
+                (6, residual_identity, vec![0, 85, 170, 255]),
             ],
             |_, _| 0, // Force a collision to exercise exact equality.
         );
-        assert_eq!(groups.len(), 4);
+        assert_eq!(groups.len(), 5);
         assert_eq!(groups[0].slots, [1, 2]);
         assert_eq!(groups[1].slots, [3]);
         assert_eq!(groups[2].slots, [4]);
         assert_eq!(groups[3].slots, [5]);
+        assert_eq!(groups[4].slots, [6]);
     }
 }
